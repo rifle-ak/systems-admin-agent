@@ -1,133 +1,173 @@
 # Systems Admin Agent
 
-SSH-based systems administration agent with automatic OS detection, application discovery, server diagnostics, and safe rollback capabilities.
+AI-powered systems administration agent. Connect to any server via SSH, diagnose issues, and fix them — using plain English.
+
+Built with Python. Uses Claude as the AI brain (token-conscious — only calls the API when human judgment is needed).
 
 ## Features
 
-- **SSH Connection Manager** — Connect to any server via password or SSH key authentication
-- **OS Detection** — Automatically identify the operating system, distribution, version, kernel, and architecture
-- **Application Discovery** — Detect web servers, databases, control panels (cPanel, Plesk, etc.), CMS platforms (WordPress, Joomla, Drupal), programming languages, and container runtimes
-- **Health Diagnostics** — 14 automated health checks including disk usage, memory, CPU load, failed services, DNS, NTP, firewall, SSL certificates, security updates, and more
-- **Auto-Fix with Approval** — Automatically propose and apply fixes for detected issues; destructive actions require explicit human approval
-- **Rollback System** — Every destructive action creates a snapshot before execution, allowing full rollback if something goes wrong
+- **Plain English Interface** — Ask things like "fix the slow page load on mysite.com" or "check why email isn't working"
+- **SSH Connection Manager** — Connect via password or SSH key
+- **OS Detection** — Identify distribution, version, kernel, architecture
+- **Application Discovery** — Detect web servers, databases, control panels (cPanel, Plesk), CMS (WordPress, Joomla, Drupal), languages, Docker containers
+- **14 Health Checks** — Disk, memory, CPU, failed services, DNS, NTP, firewall, SSL certs, security updates, and more
+- **Auto-Fix with Approval** — Propose and apply fixes; destructive actions require explicit human approval
+- **Rollback System** — Every destructive action creates a snapshot first, allowing full rollback
+- **Built-in Knowledge Base** — Local documentation for WordPress, Elementor, cPanel, Apache, Nginx, MySQL, PHP-FPM, Redis, Docker, Pterodactyl, Saltbox, and more — saves tokens by providing context without API calls
 
 ## Installation
 
 ```bash
-npm install
+pip install -e .
 ```
 
-## Usage
-
-### Full Server Scan (OS + Apps + Diagnostics)
+Or install dependencies directly:
 
 ```bash
-# Using password authentication
-npx sysadmin-agent scan -H 192.168.1.100 -u root -p 'yourpassword'
+pip install paramiko anthropic rich click
+```
 
+## Quick Start
+
+### Interactive Mode (Recommended)
+
+Connect to a server and chat with the AI agent:
+
+```bash
+sysadmin-agent --host myserver.com --username root --key ~/.ssh/id_rsa interactive
+```
+
+Then type requests in plain English:
+```
+> check disk usage and suggest cleanup
+> why is WordPress slow on this server
+> show me the top memory consumers
+> !uptime              # prefix with ! to run raw commands
+> exit
+```
+
+### Ask a Single Question
+
+```bash
+sysadmin-agent -h myserver.com -u root -k ~/.ssh/id_rsa ask "optimize page speed for WordPress"
+```
+
+### Full Server Scan
+
+```bash
 # Using SSH key
-npx sysadmin-agent scan -H myserver.com -u admin -k ~/.ssh/id_rsa
+sysadmin-agent -h myserver.com -u root -k ~/.ssh/id_rsa scan
+
+# Using password
+sysadmin-agent -h 192.168.1.100 -u root -P 'yourpassword' scan
 ```
 
-### Detect Operating System
+### Other Commands
 
 ```bash
-npx sysadmin-agent os -H 192.168.1.100 -u root -k ~/.ssh/id_rsa
+# OS detection only
+sysadmin-agent -h myserver.com -u root -k ~/.ssh/id_rsa os
+
+# Discover installed applications
+sysadmin-agent -h myserver.com -u root -k ~/.ssh/id_rsa apps
+
+# Run health checks
+sysadmin-agent -h myserver.com -u root -k ~/.ssh/id_rsa diagnose
+
+# Auto-fix issues (with approval prompts)
+sysadmin-agent -h myserver.com -u root -k ~/.ssh/id_rsa fix
+
+# Rollback a previous action
+sysadmin-agent -h myserver.com -u root -k ~/.ssh/id_rsa rollback
+
+# Execute a remote command
+sysadmin-agent -h myserver.com -u root -k ~/.ssh/id_rsa exec "ls -la /var/log"
 ```
 
-### Discover Applications
+## Configuration
+
+Set your Anthropic API key (required for `ask` and `interactive` commands):
 
 ```bash
-npx sysadmin-agent apps -H 192.168.1.100 -u root -p 'password'
+export ANTHROPIC_API_KEY="sk-ant-..."
 ```
 
-### Run Diagnostics
+Or pass it directly:
 
 ```bash
-npx sysadmin-agent diagnose -H 192.168.1.100 -u root -k ~/.ssh/id_rsa
-```
-
-### Auto-Fix Issues (with approval prompts)
-
-```bash
-npx sysadmin-agent fix -H 192.168.1.100 -u root -p 'password'
-```
-
-### Rollback a Previous Action
-
-```bash
-npx sysadmin-agent rollback -H 192.168.1.100 -u root -k ~/.ssh/id_rsa
-```
-
-### Execute a Remote Command
-
-```bash
-npx sysadmin-agent exec -H 192.168.1.100 -u root -k ~/.ssh/id_rsa -- ls -la /var/log
-npx sysadmin-agent exec -H 192.168.1.100 -u root -p 'pass' --sudo -- systemctl status nginx
+sysadmin-agent -h myserver.com -u root --api-key sk-ant-... interactive
 ```
 
 ## Connection Options
 
 | Option | Description |
 |---|---|
-| `-H, --host <host>` | Server hostname or IP address (required) |
-| `-u, --user <username>` | SSH username (required) |
-| `-p, --password <password>` | SSH password |
-| `-k, --key <path>` | Path to SSH private key file |
-| `--passphrase <passphrase>` | Passphrase for encrypted private key |
-| `--port <port>` | SSH port (default: 22) |
+| `-h, --host` | Server hostname or IP (required) |
+| `-p, --port` | SSH port (default: 22) |
+| `-u, --username` | SSH username (required) |
+| `-P, --password` | SSH password |
+| `-k, --key` | Path to SSH private key |
+| `--passphrase` | Passphrase for encrypted key |
+| `--api-key` | Anthropic API key (or set `ANTHROPIC_API_KEY`) |
+| `--auto-approve` | Skip approval prompts (use with caution) |
 
 ## Diagnostics Checks
 
-| Check | Description |
-|---|---|
-| Disk Usage | Alerts when partitions exceed 90% |
-| Memory Usage | Flags high memory consumption |
-| CPU Load | Monitors load average per CPU |
-| Zombie Processes | Detects orphaned zombie processes |
-| Failed Services | Lists systemd services in failed state |
-| DNS Resolution | Verifies DNS is working |
-| NTP Sync | Checks time synchronization |
-| Open Ports | Lists all listening ports |
-| Disk I/O Wait | Monitors disk I/O bottlenecks |
-| Swap Usage | Checks swap space pressure |
-| OOM Kills | Detects recent out-of-memory events |
-| SSL Certificates | Checks certificate expiry (certbot) |
-| Security Updates | Counts pending security patches |
-| Firewall | Verifies firewall is active |
+| Check | Threshold | Fixable |
+|---|---|---|
+| Disk Usage | >= 90% per mount | Yes |
+| Memory Usage | >= 85% | Yes |
+| CPU Load | load/cpu ratio >= 1.0 | No |
+| Zombie Processes | Any detected | Yes |
+| Failed Services | Any in failed state | Yes |
+| DNS Resolution | google.com lookup fails | Yes |
+| NTP Sync | Time not synced | Yes |
+| Open Ports | Info only | No |
+| Disk I/O Wait | >= 10% | No |
+| Swap Usage | >= 80% | No |
+| OOM Kills | Any in logs | No |
+| SSL Certificates | Expiry check | No |
+| Security Updates | Pending count | No |
+| Firewall | Status check | No |
 
 ## Safety Design
 
-1. **Non-destructive by default** — All read-only commands run without prompts
-2. **Human approval required** — Destructive actions display details and require explicit "Yes" confirmation
-3. **Automatic snapshots** — Before any destructive action, affected files and service states are backed up
-4. **Rollback on demand** — Any snapshot can be restored to revert changes
-5. **Deny-by-default in non-interactive mode** — If running without a terminal, destructive actions are denied
+1. **Non-destructive by default** — Read-only commands run without prompts
+2. **Human approval required** — Destructive actions show details and require "Yes"
+3. **Automatic snapshots** — Affected files/services backed up before changes
+4. **Rollback on demand** — Any snapshot can be restored
+5. **Deny-by-default** — Non-interactive mode denies destructive actions
+6. **Never guesses** — Asks clarifying questions when uncertain
 
 ## Testing
 
 ```bash
-npm test
+pytest tests/ -v
 ```
 
 ## Architecture
 
 ```
-src/
-  connection/SSHManager.js      — SSH connection, command execution, SFTP
-  discovery/OSDetector.js       — OS type, distro, version detection
-  discovery/AppDiscovery.js     — Application and service discovery
-  diagnostics/DiagnosticEngine.js — Health checks with fix suggestions
-  rollback/RollbackManager.js   — Snapshot creation and restoration
-  approval/ApprovalManager.js   — Human approval workflow
-  utils/formatters.js           — CLI output formatting
-  index.js                      — CLI entry point (Commander.js)
-tests/
-  SSHManager.test.js
-  OSDetector.test.js
-  ApprovalManager.test.js
-  RollbackManager.test.js
+sysadmin_agent/
+  connection/ssh_manager.py      — SSH connection, command execution, SFTP
+  discovery/os_detector.py       — OS type, distro, version detection
+  discovery/app_discovery.py     — Application and service discovery
+  diagnostics/diagnostic_engine.py — 14 health checks with fix suggestions
+  rollback/rollback_manager.py   — Snapshot creation and restoration
+  approval/approval_manager.py   — Human approval workflow
+  ai/brain.py                    — Claude API integration (token-conscious)
+  knowledge/doc_fetcher.py       — Built-in software documentation
+  utils/formatters.py            — Rich terminal output formatting
+  cli.py                         — Click-based CLI entry point
 ```
+
+## Token Efficiency
+
+The agent minimizes API costs by:
+- Running direct commands (OS detection, app discovery, diagnostics) without AI
+- Using a local knowledge base for known software docs
+- Only calling Claude when plain English interpretation or complex analysis is needed
+- Tracking and displaying token usage after every session
 
 ## License
 
