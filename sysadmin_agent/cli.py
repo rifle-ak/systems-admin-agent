@@ -932,13 +932,13 @@ def interactive(ctx):
 def web(ctx, web_host, web_port, debug):
     """Launch the web UI."""
     try:
-        from sysadmin_agent.web.app import create_app, socketio
+        from sysadmin_agent.web.app import create_app
     except ImportError as e:
         error_console.print(f"[bold red]Missing web dependencies:[/] {e}")
         error_console.print("Install with: pip install flask flask-socketio python-dotenv")
         sys.exit(1)
 
-    app = create_app()
+    app, socketio = create_app()
     console.print(f"[bold green]Starting web UI at http://{web_host}:{web_port}[/]")
     socketio.run(app, host=web_host, port=web_port, debug=debug, allow_unsafe_werkzeug=True)
 
