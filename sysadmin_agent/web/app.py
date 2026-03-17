@@ -429,6 +429,52 @@ def setup_configure():
 
 
 # ---------------------------------------------------------------------------
+# HTTP Routes — Server profiles
+# ---------------------------------------------------------------------------
+
+@app.route("/api/profiles", methods=["GET"])
+@_require_auth
+def list_profiles():
+    """Return all saved server profiles as a JSON array."""
+    result = []
+    for name, prof in server_profiles.items():
+        entry = dict(prof) if isinstance(prof, dict) else {}
+        entry.setdefault("name", name)
+        result.append(entry)
+    return jsonify(result)
+
+
+@app.route("/api/profiles", methods=["POST"])
+@_require_auth
+def save_profile():
+    """Create or update a server profile."""
+    global server_profiles
+    data = request.get_json(force=True)
+    name = data.get("name", "").strip()
+    if not name:
+        return jsonify({"error": "Profile name is required"}), 400
+
+    server_profiles[name] = {
+        k: v for k, v in data.items() if k != "name"
+    }
+    _save_config(server_profiles)
+    return jsonify({"status": "ok", "name": name})
+
+
+@app.route("/api/profiles/<name>", methods=["DELETE"])
+@_require_auth
+def delete_profile(name):
+    """Delete a server profile by name."""
+    global server_profiles
+    if name not in server_profiles:
+        return jsonify({"error": "Profile not found"}), 404
+
+    del server_profiles[name]
+    _save_config(server_profiles)
+    return jsonify({"status": "ok"})
+
+
+# ---------------------------------------------------------------------------
 # HTTP Routes — Auth
 # ---------------------------------------------------------------------------
 
