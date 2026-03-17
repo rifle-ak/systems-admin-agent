@@ -20,42 +20,168 @@ Built with Python. Uses Claude as the AI brain (token-conscious — only calls t
 - **Auto-Updater** — Pull latest version without destroying your configs
 - **Built-in Knowledge Base** — Local documentation for WordPress, Elementor, cPanel, Apache, Nginx, MySQL, PHP-FPM, Redis, Docker, Pterodactyl, Saltbox, and more — saves tokens by providing context without API calls
 
-## Quick Start — Web UI
+---
 
-The easiest way to get started. Upload the files to your server, then:
+## Installation
+
+Choose your path — **Web UI** (recommended for most users) or **CLI** (for terminal users).
+
+---
+
+### Option A: Web UI on cPanel
+
+Best for: hosting the agent on a cPanel server with a domain, accessible from any browser.
+
+#### 1. Create a cPanel account
+
+In WHM, create a new account (or use an existing one) and assign a domain or subdomain to it, for example `agent.yourdomain.com`.
+
+#### 2. SSH into the account
 
 ```bash
-# 1. Install Python dependencies
+ssh youraccount@yourserver.com
+```
+
+Or use the cPanel Terminal (cPanel > Advanced > Terminal).
+
+#### 3. Clone the repo into your home directory
+
+```bash
+cd ~
+git clone https://github.com/rifle-ak/systems-admin-agent.git
+cd systems-admin-agent
+```
+
+#### 4. Install Python dependencies (user-level, no root needed)
+
+```bash
+pip install --user paramiko anthropic rich click flask flask-socketio python-dotenv
+```
+
+If `pip` isn't available, try `pip3` or `python3 -m pip`.
+
+#### 5. Configure
+
+```bash
+cp .env.example .env
+nano .env
+```
+
+At minimum, set:
+```
+ANTHROPIC_API_KEY=sk-ant-your-key-here
+WEB_PASSWORD=pick-a-strong-password
+```
+
+#### 6. Start the web UI
+
+```bash
+python3 -m sysadmin_agent web --web-port 5000
+```
+
+#### 7. Access it
+
+Open `http://agent.yourdomain.com:5000` in your browser.
+
+The setup wizard will verify everything is installed correctly. If anything is missing, it will offer to install it for you.
+
+#### Keeping it running (optional)
+
+To keep the agent running after you close your SSH session:
+
+```bash
+# Using nohup
+nohup python3 -m sysadmin_agent web --web-port 5000 &
+
+# Or using screen
+screen -S sysadmin
+python3 -m sysadmin_agent web --web-port 5000
+# Press Ctrl+A then D to detach. Reattach with: screen -r sysadmin
+```
+
+#### cPanel Proxy (optional, use port 443 instead of 5000)
+
+If you want to access the agent through your domain without a port number, set up a cPanel Application in **cPanel > Setup Python App** (if available) or use an `.htaccess` proxy rule. This depends on your hosting setup — ask the agent itself for help once it's running.
+
+---
+
+### Option B: Web UI on Any Linux Server
+
+Best for: VPS, dedicated servers, cloud instances (AWS, DigitalOcean, Vultr, etc.).
+
+```bash
+# 1. Clone
+git clone https://github.com/rifle-ak/systems-admin-agent.git
+cd systems-admin-agent
+
+# 2. Install dependencies
 pip install --user paramiko anthropic rich click flask flask-socketio python-dotenv
 
-# 2. Start the web UI
-python -m sysadmin_agent web --web-port 5000
+# 3. Configure
+cp .env.example .env
+nano .env   # Set ANTHROPIC_API_KEY and WEB_PASSWORD
+
+# 4. Start
+python3 -m sysadmin_agent web --web-port 5000
 ```
 
-Open `http://your-server:5000` in a browser. The setup wizard will:
-1. Check for missing dependencies and offer to install them
-2. Ask for your Anthropic API key
-3. Redirect you to the dashboard
+Open `http://your-server-ip:5000` in your browser.
 
-From the dashboard, connect to any server and start chatting in plain English.
+> **Firewall note:** Make sure port 5000 is open, or use `--web-port 80` if port 80 is free. For production, consider putting it behind Nginx with SSL.
 
-## Quick Start — CLI
+---
+
+### Option C: Web UI on macOS
+
+Best for: running from your laptop to manage remote servers.
 
 ```bash
-# Set your API key
-export ANTHROPIC_API_KEY="sk-ant-..."
+# 1. Clone
+git clone https://github.com/rifle-ak/systems-admin-agent.git
+cd systems-admin-agent
 
-# Interactive mode (connect once, ask multiple questions)
-sysadmin-agent -h myserver.com -u root -k ~/.ssh/id_rsa interactive
+# 2. Install dependencies (use pip3 on macOS)
+pip3 install paramiko anthropic rich click flask flask-socketio python-dotenv
 
-# Ask a single question
-sysadmin-agent -h myserver.com -u root -k ~/.ssh/id_rsa ask "optimize page speed for WordPress"
+# 3. Configure
+cp .env.example .env
+nano .env   # Set ANTHROPIC_API_KEY
 
-# Full server scan
-sysadmin-agent -h myserver.com -u root -k ~/.ssh/id_rsa scan
+# 4. Start
+python3 -m sysadmin_agent web --web-port 5000
 ```
 
-Interactive mode commands:
+Open `http://localhost:5000` in your browser. No password needed when running locally.
+
+---
+
+### Option D: CLI Only (No Web UI)
+
+Best for: terminal-savvy users who prefer SSH + command line.
+
+```bash
+# 1. Clone
+git clone https://github.com/rifle-ak/systems-admin-agent.git
+cd systems-admin-agent
+
+# 2. Install dependencies (fewer than web UI — no flask needed)
+pip install --user paramiko anthropic rich click
+
+# 3. Set your API key
+export ANTHROPIC_API_KEY="sk-ant-..."
+
+# 4. Use it
+# Interactive mode (recommended — connect once, ask multiple questions)
+python3 -m sysadmin_agent -h myserver.com -u root -k ~/.ssh/id_rsa interactive
+
+# Or ask a single question
+python3 -m sysadmin_agent -h myserver.com -u root -k ~/.ssh/id_rsa ask "optimize WordPress page speed"
+
+# Or run a full scan
+python3 -m sysadmin_agent -h myserver.com -u root -k ~/.ssh/id_rsa scan
+```
+
+Interactive mode:
 ```
 > check disk usage and suggest cleanup
 > why is WordPress slow on this server
@@ -64,10 +190,75 @@ Interactive mode commands:
 > exit
 ```
 
+---
+
+## Using the Web UI
+
+Once the setup wizard completes, you'll land on the dashboard.
+
+### Connecting to a server
+1. Fill in the connection form in the left sidebar (host, username, password or key path)
+2. Click **Connect**
+3. The agent will scan the server and show you what it found (OS, apps, services)
+
+### Asking questions
+Type in the chat box at the bottom, in plain English:
+- "Why is this WordPress site slow?"
+- "Check if there are any security issues"
+- "Optimize PHP-FPM for this server"
+- "Show me disk usage"
+
+### Running raw commands
+Prefix with `!` or toggle to command mode:
+- `!uptime`
+- `!df -h`
+- `!wp plugin list --path=/home/user/public_html`
+
+### Quick actions
+Use the sidebar buttons for common tasks:
+- **Scan** — Full server scan (OS + apps + diagnostics)
+- **Diagnose** — Run health checks only
+- **Fix** — Find and fix issues (asks for approval on destructive actions)
+
+### Approval flow
+When the agent wants to do something destructive (restart a service, modify a config file), it will show an approval card with:
+- The exact command it wants to run
+- A description of what it does
+- A snapshot ID (for rollback if needed)
+
+Click **Approve** or **Deny**. If you don't respond within 60 seconds, it's automatically denied.
+
+### Server profiles
+Save connection details so you don't retype them:
+1. Fill in the connection form
+2. Click **Save Profile**
+3. Next time, select from the dropdown
+
+Passwords are never stored — the agent only saves a "password required" flag and asks you each time.
+
+---
+
+## Configuration
+
+Copy `.env.example` to `.env` and set your values:
+
+```bash
+cp .env.example .env
+```
+
+| Setting | Required | Description |
+|---|---|---|
+| `ANTHROPIC_API_KEY` | Yes | Your Anthropic API key for AI features |
+| `WEB_PASSWORD` | Recommended | Password to protect the web UI (leave empty for no auth) |
+| `SECRET_KEY` | No | Flask secret key (auto-generated if not set) |
+| `AI_MODEL` | No | AI model (default: `claude-sonnet-4-20250514`) |
+
+---
+
 ## All CLI Commands
 
 ```bash
-sysadmin-agent [SSH OPTIONS] <command>
+python3 -m sysadmin_agent [SSH OPTIONS] <command>
 
 # Server analysis
 scan          # Full scan: OS + apps + diagnostics
@@ -88,31 +279,20 @@ exec "cmd"    # Execute a remote command
 web           # Launch web UI (--web-port, --web-host, --debug)
 ```
 
-## SSH Options
+### SSH Options
 
 | Option | Description |
 |---|---|
-| `-h, --host` | Server hostname or IP (required) |
+| `-h, --host` | Server hostname or IP (required for SSH commands) |
 | `-p, --port` | SSH port (default: 22) |
-| `-u, --username` | SSH username (required) |
+| `-u, --username` | SSH username (required for SSH commands) |
 | `-P, --password` | SSH password |
 | `-k, --key` | Path to SSH private key |
 | `--passphrase` | Passphrase for encrypted key |
 | `--api-key` | Anthropic API key (or set `ANTHROPIC_API_KEY`) |
 | `--auto-approve` | Skip approval prompts (use with caution) |
 
-## Configuration
-
-Copy `.env.example` to `.env` and fill in your values:
-
-```bash
-cp .env.example .env
-```
-
-Key settings:
-- `ANTHROPIC_API_KEY` — Required for AI features
-- `WEB_PASSWORD` — Optional password to protect the web UI
-- `AI_MODEL` — AI model to use (default: claude-sonnet-4-20250514)
+---
 
 ## System Health Checks (14)
 
@@ -153,22 +333,27 @@ Key settings:
 | Security | xmlrpc.php, directory listing, file editing, login protection |
 | Elementor Health | Version, CSS output, asset loading, DOM optimization |
 
+---
+
 ## Safety Design
 
 1. **Non-destructive by default** — Read-only commands run without prompts
 2. **Human approval required** — Destructive actions show details and require "Yes"
 3. **Automatic snapshots** — Affected files/services backed up before changes
 4. **Rollback on demand** — Any snapshot can be restored
-5. **Deny-by-default** — Non-interactive mode denies destructive actions
+5. **Deny-by-default** — Non-interactive mode and approval timeouts default to deny
 6. **Never guesses** — Asks clarifying questions when uncertain
 7. **Passwords never stored** — Server profiles store a "password required" flag, not the actual password
+
+---
 
 ## Auto-Updater
 
 Pull the latest version while preserving your configs:
 
 ```bash
-python -m sysadmin_agent.updater
+cd ~/systems-admin-agent
+python3 -m sysadmin_agent.updater
 ```
 
 The updater:
@@ -178,6 +363,19 @@ The updater:
 - Comments out removed keys (marked with `# REMOVED in update`)
 - Updates Python dependencies automatically
 - Can rollback if something goes wrong
+
+---
+
+## Token Efficiency
+
+The agent minimizes API costs by:
+- Running direct commands (OS detection, app discovery, diagnostics) without AI
+- Using a local knowledge base for known software docs
+- Condensing conversation history into summaries instead of sending full transcripts
+- Only calling Claude when plain English interpretation or complex analysis is needed
+- Tracking and displaying token usage after every session
+
+---
 
 ## Architecture
 
@@ -201,15 +399,6 @@ sysadmin_agent/
   utils/formatters.py              — Rich terminal output formatting
   cli.py                           — Click-based CLI entry point
 ```
-
-## Token Efficiency
-
-The agent minimizes API costs by:
-- Running direct commands (OS detection, app discovery, diagnostics) without AI
-- Using a local knowledge base for known software docs
-- Condensing conversation history into summaries instead of sending full transcripts
-- Only calling Claude when plain English interpretation or complex analysis is needed
-- Tracking and displaying token usage after every session
 
 ## Testing
 
