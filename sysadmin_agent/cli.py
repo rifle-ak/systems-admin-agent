@@ -935,7 +935,7 @@ def web(ctx, web_host, web_port, debug):
         from sysadmin_agent.web.app import create_app
     except ImportError as e:
         error_console.print(f"[bold red]Missing web dependencies:[/] {e}")
-        error_console.print("Install with: pip install flask flask-socketio python-dotenv")
+        error_console.print("Install with: pip install flask flask-socketio simple-websocket python-dotenv")
         sys.exit(1)
 
     app, socketio = create_app()
