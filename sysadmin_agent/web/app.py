@@ -274,21 +274,80 @@ def _get_conversation(sid: str) -> list:
 
 
 def _build_server_context(sid: str) -> dict:
-    """Build a context dict from what we know about the connected server."""
+    """Build a context dict from what we know about the connected server.
+
+    Mirrors the structured format used by cli._build_server_context so the
+    AI brain gets clean, readable context rather than raw JSON dumps.
+    """
     data = _get_session_data(sid)
     ctx: dict = {}
-    if "os_info" in data:
-        ctx["os"] = json.dumps(data["os_info"])
-    if "apps" in data:
-        ctx["installed_software"] = json.dumps(data["apps"])
+
+    os_info = data.get("os_info")
+    if os_info:
+        ctx["os"] = (
+            f"{os_info.get('distribution', 'unknown')} "
+            f"{os_info.get('version', '')}".strip()
+        )
+        ctx["kernel"] = os_info.get("kernel", "unknown")
+        ctx["architecture"] = os_info.get("architecture", "unknown")
+        ctx["hostname"] = os_info.get("hostname", "unknown")
+
+    apps = data.get("apps")
+    if apps:
+        web = [w.get("name", "") for w in apps.get("web_servers", [])]
+        if web:
+            ctx["web_servers"] = ", ".join(web)
+        dbs = [d.get("name", "") for d in apps.get("databases", [])]
+        if dbs:
+            ctx["databases"] = ", ".join(dbs)
+        panels = [p.get("name", "") for p in apps.get("control_panels", [])]
+        if panels:
+            ctx["control_panels"] = ", ".join(panels)
+        cms = [c.get("name", "") for c in apps.get("cms", [])]
+        if cms:
+            ctx["cms"] = ", ".join(cms)
+        langs = [l.get("name", "") for l in apps.get("languages", [])]
+        if langs:
+            ctx["languages"] = ", ".join(langs)
+        containers = [c.get("name", "") for c in apps.get("containers", [])]
+        if containers:
+            ctx["container_runtimes"] = ", ".join(containers)
+        services = apps.get("services", [])
+        running = sum(1 for s in services if s.get("status") == "running")
+        ctx["services"] = f"{running} running out of {len(services)} total"
+
     if "diagnostics" in data:
         summary = [
             f"{d['name']}: {d['status']}"
             for d in data["diagnostics"]
-            if d["status"] != "ok"
+            if d.get("status") != "ok"
         ]
         if summary:
             ctx["diagnostic_issues"] = "; ".join(summary)
+
+    # Enrich with documentation context for discovered software
+    try:
+        mods = _import_agent_modules()
+        fetcher = mods["DocFetcher"]()
+        software_names = set()
+        if os_info:
+            dist = os_info.get("distribution", "")
+            if dist:
+                software_names.add(dist.lower())
+        if apps:
+            for category in ("web_servers", "databases", "control_panels",
+                             "cms", "languages", "containers"):
+                for item in apps.get(category, []):
+                    name = item.get("name", "")
+                    if name:
+                        software_names.add(name.lower())
+        for name in software_names:
+            doc = fetcher.get_context(name)
+            if doc:
+                ctx[f"docs_{name}"] = json.dumps(doc) if not isinstance(doc, str) else doc
+    except Exception:
+        pass
+
     return ctx
 
 
@@ -549,7 +608,7 @@ def handle_connect_server(data):
         port = int(data.get("port", 22))
         username = data["username"]
         password = data.get("password")
-        private_key_path = data.get("private_key_path")
+        private_key_path = data.get("private_key_path") or data.get("key_path")
         passphrase = data.get("passphrase")
 
         emit("status", {"message": f"Connecting to {host}:{port}..."})
@@ -795,7 +854,7 @@ def handle_ask_agent(data):
 @socketio.on("approve_action")
 def handle_approve_action(data):
     """User approves or denies a pending action."""
-    approval_id = data.get("approval_id")
+    approval_id = data.get("approval_id") or data.get("id")
     approved = data.get("approved", False)
 
     pending = _pending_approvals.get(approval_id)
@@ -813,7 +872,7 @@ def handle_approve_action(data):
 
 
 @socketio.on("run_fix")
-def handle_run_fix(data):
+def handle_run_fix(data=None):
     """Run diagnostics and auto-apply fixes (with web-based approval)."""
     sid = request.sid
     ssh = _get_ssh(sid)
@@ -862,13 +921,15 @@ def handle_run_fix(data):
 
 
 @socketio.on("rollback")
-def handle_rollback(data):
+def handle_rollback(data=None):
     """List snapshots or execute a rollback."""
     sid = request.sid
     ssh = _get_ssh(sid)
     if not ssh:
         emit("error", {"message": "Not connected to a server."})
         return
+
+    data = data or {}
 
     try:
         mods = _import_agent_modules()
@@ -909,6 +970,15 @@ def handle_rollback(data):
     except Exception as exc:
         logger.exception("rollback failed")
         emit("error", {"message": f"Rollback error: {exc}"})
+
+
+@socketio.on("rollback_execute")
+def handle_rollback_execute(data):
+    """Shorthand for rollback with action=execute, used by the frontend."""
+    if not data:
+        data = {}
+    data["action"] = "execute"
+    return handle_rollback(data)
 
 
 @socketio.on("exec_command")
