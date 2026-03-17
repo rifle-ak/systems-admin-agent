@@ -56,7 +56,13 @@ function initSocket() {
 
     // Scan events
     socket.on('scan_progress', onScanProgress);
+    socket.on('scan_os', onScanProgress);
+    socket.on('scan_apps', onScanProgress);
+    socket.on('scan_diagnostics', onDiagnosticsResult);
     socket.on('scan_complete', onScanComplete);
+
+    // Status messages (progress updates during scan/diagnostics)
+    socket.on('status', onScanProgress);
 
     // Diagnostics events
     socket.on('diagnostics_result', onDiagnosticsResult);
@@ -203,8 +209,11 @@ function renderDiagnostics(results) {
 
     for (const check of results) {
         const tr = document.createElement('tr');
-        const statusClass = check.status === 'pass' ? 'pass' : (check.status === 'warning' ? 'warn' : 'fail');
-        const statusSymbol = check.status === 'pass' ? '\u2713' : (check.status === 'warning' ? '\u26A0' : '\u2717');
+        const st = check.status || '';
+        const isOk = st === 'ok' || st === 'pass' || st === 'info';
+        const isWarn = st === 'warning';
+        const statusClass = isOk ? 'pass' : (isWarn ? 'warn' : 'fail');
+        const statusSymbol = isOk ? '\u2713' : (isWarn ? '\u26A0' : '\u2717');
         const severity = (check.severity || 'info').toLowerCase();
 
         tr.innerHTML = `
@@ -344,12 +353,40 @@ function onScanProgress(data) {
 
 function onScanComplete(data) {
     removeMessage('scan-progress-msg');
-    addMessage('agent', 'Scan complete. ' + escapeHtml(data.summary || ''));
+
+    // Render OS info if present
+    if (data.os_info) {
+        const info = data.os_info;
+        let osText = '<strong>OS Info:</strong> ';
+        osText += escapeHtml(info.distro || info.os || 'Unknown');
+        if (info.hostname) osText += ' | Host: ' + escapeHtml(info.hostname);
+        if (info.uptime) osText += ' | Uptime: ' + escapeHtml(info.uptime);
+        addMessage('agent', osText);
+
+        // Update sidebar info panel
+        if ($('#infoOS')) $('#infoOS').textContent = info.distro || info.os || '-';
+        if ($('#infoHostname')) $('#infoHostname').textContent = info.hostname || '-';
+        if ($('#infoUptime')) $('#infoUptime').textContent = info.uptime || '-';
+    }
+
+    // Render discovered apps if present
+    if (data.apps && data.apps.length > 0) {
+        const appNames = data.apps.map(a => typeof a === 'string' ? a : (a.name || a.service || JSON.stringify(a)));
+        addMessage('agent', '<strong>Applications:</strong> ' + escapeHtml(appNames.join(', ')));
+    }
+
+    // Render diagnostics if present
+    if (data.diagnostics && data.diagnostics.length > 0) {
+        const table = renderDiagnostics(data.diagnostics);
+        addMessage('agent', table);
+    }
+
+    addMessage('system', 'Scan complete.');
 }
 
 function onDiagnosticsResult(data) {
     removeMessage('thinking-msg');
-    const results = data.results || data.checks || data;
+    const results = data.diagnostics || data.results || data.checks || data;
     const table = renderDiagnostics(Array.isArray(results) ? results : []);
     addMessage('agent', table);
 }

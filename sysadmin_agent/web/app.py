@@ -690,7 +690,7 @@ def handle_ask_agent(data):
         emit("error", {"message": "Not connected to a server."})
         return
 
-    user_request = data.get("message", "").strip()
+    user_request = (data.get("message") or data.get("request") or "").strip()
     if not user_request:
         emit("error", {"message": "Empty request."})
         return
