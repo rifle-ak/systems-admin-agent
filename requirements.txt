@@ -4,4 +4,5 @@ rich>=13.0
 click>=8.0
 flask>=3.0
 flask-socketio>=5.0
+simple-websocket>=1.0
 python-dotenv>=1.0

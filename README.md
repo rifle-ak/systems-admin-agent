@@ -55,7 +55,7 @@ cd systems-admin-agent
 #### 4. Install Python dependencies (user-level, no root needed)
 
 ```bash
-pip install --user paramiko anthropic rich click flask flask-socketio python-dotenv
+pip install --user paramiko anthropic rich click flask flask-socketio simple-websocket python-dotenv
 ```
 
 If `pip` isn't available, try `pip3` or `python3 -m pip`.
@@ -115,7 +115,7 @@ git clone https://github.com/rifle-ak/systems-admin-agent.git
 cd systems-admin-agent
 
 # 2. Install dependencies
-pip install --user paramiko anthropic rich click flask flask-socketio python-dotenv
+pip install --user paramiko anthropic rich click flask flask-socketio simple-websocket python-dotenv
 
 # 3. Configure
 cp .env.example .env
@@ -141,7 +141,7 @@ git clone https://github.com/rifle-ak/systems-admin-agent.git
 cd systems-admin-agent
 
 # 2. Install dependencies (use pip3 on macOS)
-pip3 install paramiko anthropic rich click flask flask-socketio python-dotenv
+pip3 install paramiko anthropic rich click flask flask-socketio simple-websocket python-dotenv
 
 # 3. Configure
 cp .env.example .env
