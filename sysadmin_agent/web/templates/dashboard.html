@@ -1,0 +1,155 @@
+{% extends "base.html" %}
+{% block title %}Dashboard - SysAdmin Agent{% endblock %}
+
+{% block content %}
+<div class="dashboard-layout">
+    <!-- Left Sidebar -->
+    <aside class="sidebar" id="sidebar">
+        <!-- Server Connection -->
+        <div class="sidebar-section">
+            <h3 class="sidebar-heading">Server Connection</h3>
+
+            <div class="form-group">
+                <label for="profileSelect">Saved Profiles</label>
+                <div class="profile-row">
+                    <select id="profileSelect" class="form-input form-select">
+                        <option value="">-- Select profile --</option>
+                    </select>
+                    <button class="btn btn-small btn-secondary" onclick="loadProfile()" title="Load">Load</button>
+                    <button class="btn btn-small btn-danger" onclick="deleteProfile()" title="Delete">Del</button>
+                </div>
+            </div>
+
+            <form id="connectForm" onsubmit="connectServer(event)">
+                <div class="form-group">
+                    <label for="host">Host</label>
+                    <input type="text" id="host" class="form-input" placeholder="192.168.1.100" required>
+                </div>
+                <div class="form-row">
+                    <div class="form-group flex-grow">
+                        <label for="port">Port</label>
+                        <input type="number" id="port" class="form-input" value="22" min="1" max="65535">
+                    </div>
+                    <div class="form-group flex-grow">
+                        <label for="username">Username</label>
+                        <input type="text" id="username" class="form-input" placeholder="root">
+                    </div>
+                </div>
+                <div class="form-group">
+                    <label for="authType">Auth Type</label>
+                    <select id="authType" class="form-input form-select" onchange="toggleAuthFields()">
+                        <option value="password">Password</option>
+                        <option value="key">SSH Key</option>
+                    </select>
+                </div>
+                <div id="passwordFields">
+                    <div class="form-group">
+                        <label for="sshPassword">Password</label>
+                        <input type="password" id="sshPassword" class="form-input" placeholder="Server password">
+                    </div>
+                </div>
+                <div id="keyFields" style="display: none;">
+                    <div class="form-group">
+                        <label for="keyPath">Key Path</label>
+                        <input type="text" id="keyPath" class="form-input" placeholder="~/.ssh/id_rsa">
+                    </div>
+                    <div class="form-group">
+                        <label for="passphrase">Passphrase (optional)</label>
+                        <input type="password" id="passphrase" class="form-input" placeholder="Key passphrase">
+                    </div>
+                </div>
+
+                <div class="form-row">
+                    <button type="submit" class="btn btn-primary flex-grow" id="connectBtn">Connect</button>
+                    <button type="button" class="btn btn-secondary" id="saveProfileBtn" onclick="saveProfile()">Save</button>
+                </div>
+                <button type="button" class="btn btn-danger btn-full" id="disconnectBtn" onclick="disconnectServer()" style="display: none;">Disconnect</button>
+            </form>
+        </div>
+
+        <!-- Server Info (shown when connected) -->
+        <div class="sidebar-section" id="serverInfo" style="display: none;">
+            <h3 class="sidebar-heading">Server Info</h3>
+            <div class="info-grid">
+                <div class="info-item">
+                    <span class="info-label">OS</span>
+                    <span class="info-value" id="infoOS">-</span>
+                </div>
+                <div class="info-item">
+                    <span class="info-label">Hostname</span>
+                    <span class="info-value" id="infoHostname">-</span>
+                </div>
+                <div class="info-item">
+                    <span class="info-label">Uptime</span>
+                    <span class="info-value" id="infoUptime">-</span>
+                </div>
+            </div>
+        </div>
+
+        <!-- Quick Actions -->
+        <div class="sidebar-section" id="quickActions" style="display: none;">
+            <h3 class="sidebar-heading">Quick Actions</h3>
+            <div class="action-buttons">
+                <button class="btn btn-action" onclick="runScan()">
+                    <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2">
+                        <circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/>
+                    </svg>
+                    Scan
+                </button>
+                <button class="btn btn-action" onclick="runDiagnostics()">
+                    <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2">
+                        <path d="M22 12h-4l-3 9L9 3l-3 9H2"/>
+                    </svg>
+                    Diagnose
+                </button>
+                <button class="btn btn-action btn-action-warn" onclick="runFix()">
+                    <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2">
+                        <path d="M14.7 6.3a1 1 0 0 0 0 1.4l1.6 1.6a1 1 0 0 0 1.4 0l3.77-3.77a6 6 0 0 1-7.94 7.94l-6.91 6.91a2.12 2.12 0 0 1-3-3l6.91-6.91a6 6 0 0 1 7.94-7.94l-3.76 3.76z"/>
+                    </svg>
+                    Fix Issues
+                </button>
+            </div>
+        </div>
+    </aside>
+
+    <!-- Main Chat Area -->
+    <div class="chat-container">
+        <div class="chat-messages" id="chatMessages">
+            <div class="message system-message">
+                <div class="message-content">
+                    Welcome to SysAdmin Agent. Connect to a server to get started.
+                </div>
+            </div>
+        </div>
+
+        <!-- Input Bar -->
+        <div class="chat-input-bar">
+            <div class="input-row">
+                <div class="input-wrapper">
+                    <textarea id="chatInput" class="chat-input" placeholder="Ask anything about your server..." rows="1"></textarea>
+                </div>
+                <div class="input-controls">
+                    <label class="cmd-toggle" title="Command mode (raw shell commands)">
+                        <input type="checkbox" id="cmdMode">
+                        <span class="cmd-toggle-label">&gt;_</span>
+                    </label>
+                    <button class="btn btn-send" id="sendBtn" onclick="sendMessage()">
+                        <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2">
+                            <line x1="22" y1="2" x2="11" y2="13"/>
+                            <polygon points="22 2 15 22 11 13 2 9 22 2"/>
+                        </svg>
+                    </button>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+document.addEventListener('DOMContentLoaded', () => {
+    initDashboard();
+});
+</script>
+{% endblock %}
