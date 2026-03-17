@@ -1,0 +1,367 @@
+SOFTWARE_DB = {
+    "wordpress": {
+        "config_paths": [
+            "/var/www/*/wp-config.php",
+            "/home/*/public_html/wp-config.php",
+            "/var/www/html/wp-config.php",
+        ],
+        "common_issues": [
+            "White screen of death — usually a PHP fatal error; check debug.log",
+            "Database connection errors — check DB_HOST, DB_USER, DB_PASSWORD in wp-config.php",
+            "Slow queries — enable SAVEQUERIES or use Query Monitor plugin",
+            "Permalink 404s — flush rewrite rules or check .htaccess / Nginx rewrite block",
+            "Memory exhaustion — raise WP_MEMORY_LIMIT in wp-config.php",
+            "Cron not firing — check DISABLE_WP_CRON and system crontab",
+            "File permission issues — wp-content should be 755/644, owned by web server user",
+        ],
+        "useful_commands": [
+            "wp core version --path=/var/www/html",
+            "wp plugin list --path=/var/www/html --format=table",
+            "wp db check --path=/var/www/html",
+            "wp cron event list --path=/var/www/html",
+            "wp option get siteurl --path=/var/www/html",
+            "wp cache flush --path=/var/www/html",
+            "tail -n 50 /var/www/html/wp-content/debug.log",
+        ],
+        "doc_url": "https://developer.wordpress.org/",
+    },
+    "elementor": {
+        "config_paths": [
+            "/var/www/*/wp-content/plugins/elementor/",
+            "/var/www/*/wp-content/plugins/elementor-pro/",
+        ],
+        "common_issues": [
+            "Editor not loading — often a PHP memory or execution time limit",
+            "CSS not regenerating — clear Elementor cache via Tools > Regenerate CSS",
+            "Font Awesome missing — check FA loading method in Elementor settings",
+            "Broken layout after update — regenerate CSS and flush CDN/server cache",
+            "Slow editor — too many global widgets/fonts, or low PHP memory_limit",
+        ],
+        "useful_commands": [
+            "wp elementor flush-css --path=/var/www/html",
+            "wp option get elementor_version --path=/var/www/html",
+            "wp plugin status elementor --path=/var/www/html",
+            "wp plugin status elementor-pro --path=/var/www/html",
+        ],
+        "doc_url": "https://developers.elementor.com/docs/",
+    },
+    "cpanel": {
+        "config_paths": [
+            "/var/cpanel/cpanel.config",
+            "/etc/cpanel/ea4/ea4.conf",
+            "/var/cpanel/users/",
+            "/etc/apache2/conf.d/userdata/",
+            "/var/cpanel/php/fpm/",
+        ],
+        "common_issues": [
+            "License invalid — check /usr/local/cpanel/cpkeyclt",
+            "Apache not starting — check /etc/apache2/conf/httpd.conf syntax",
+            "Email delivery failures — check /var/log/exim_mainlog and mail queue",
+            "Account over quota — check quota with repquota or WHM",
+            "PHP version mismatch — check MultiPHP Manager and .htaccess",
+        ],
+        "useful_commands": [
+            "/usr/local/cpanel/cpkeyclt",
+            "whmapi1 listaccts",
+            "whmapi1 version",
+            "/scripts/restartsrv_httpd --status",
+            "/scripts/restartsrv_mysql --status",
+            "uapi --user=USERNAME Email list_pops_with_disk",
+            "/usr/local/cpanel/bin/rebuild_phpconf --current",
+            "exim -bpc",  # mail queue count
+        ],
+        "doc_url": "https://docs.cpanel.net/",
+    },
+    "apache": {
+        "config_paths": [
+            "/etc/apache2/apache2.conf",
+            "/etc/httpd/conf/httpd.conf",
+            "/etc/apache2/sites-available/",
+            "/etc/apache2/sites-enabled/",
+            "/etc/httpd/conf.d/",
+        ],
+        "common_issues": [
+            "Config syntax error — run apachectl configtest before restart",
+            "Port conflict — check if another process holds port 80/443",
+            "mod_rewrite not loaded — a2enmod rewrite on Debian/Ubuntu",
+            ".htaccess not honored — check AllowOverride directive",
+            "High memory usage — tune MaxRequestWorkers / MaxClients",
+        ],
+        "useful_commands": [
+            "apachectl configtest",
+            "apachectl -S",  # vhost listing
+            "apachectl -M",  # loaded modules
+            "systemctl status apache2 || systemctl status httpd",
+            "tail -n 50 /var/log/apache2/error.log || tail -n 50 /var/log/httpd/error_log",
+            "ss -tlnp | grep :80",
+        ],
+        "doc_url": "https://httpd.apache.org/docs/2.4/",
+    },
+    "nginx": {
+        "config_paths": [
+            "/etc/nginx/nginx.conf",
+            "/etc/nginx/sites-available/",
+            "/etc/nginx/sites-enabled/",
+            "/etc/nginx/conf.d/",
+        ],
+        "common_issues": [
+            "Config syntax error — run nginx -t before reload",
+            "502 Bad Gateway — upstream (PHP-FPM, app server) is down or socket mismatch",
+            "413 Request Entity Too Large — increase client_max_body_size",
+            "Permission denied on socket — check user/group in FPM pool and Nginx worker",
+            "SSL certificate chain incomplete — check ssl_certificate includes intermediate",
+        ],
+        "useful_commands": [
+            "nginx -t",
+            "nginx -T",  # dump full config
+            "systemctl status nginx",
+            "tail -n 50 /var/log/nginx/error.log",
+            "ss -tlnp | grep :80",
+            "ss -tlnp | grep :443",
+        ],
+        "doc_url": "https://nginx.org/en/docs/",
+    },
+    "mysql": {
+        "config_paths": [
+            "/etc/mysql/my.cnf",
+            "/etc/my.cnf",
+            "/etc/mysql/mysql.conf.d/mysqld.cnf",
+            "/etc/mysql/mariadb.conf.d/",
+        ],
+        "common_issues": [
+            "Too many connections — check max_connections and connection leaks",
+            "Slow queries — enable slow_query_log, check long_query_time",
+            "InnoDB corruption — check ibdata1 and ib_logfile integrity",
+            "Disk space full — purge binary logs, check tmpdir",
+            "Authentication plugin mismatch — mysql_native_password vs caching_sha2_password",
+            "Replication lag — check SHOW SLAVE STATUS or SHOW REPLICA STATUS",
+        ],
+        "useful_commands": [
+            "mysqladmin status",
+            "mysqladmin processlist",
+            "mysql -e 'SHOW GLOBAL STATUS'",
+            "mysql -e 'SHOW GLOBAL VARIABLES LIKE \"%slow%\"'",
+            "mysql -e 'SHOW ENGINE INNODB STATUS\\G'",
+            "systemctl status mysql || systemctl status mariadb",
+            "du -sh /var/lib/mysql/",
+        ],
+        "doc_url": "https://dev.mysql.com/doc/refman/8.0/en/",
+    },
+    "mariadb": {
+        "config_paths": [
+            "/etc/mysql/mariadb.conf.d/",
+            "/etc/my.cnf",
+            "/etc/mysql/my.cnf",
+        ],
+        "common_issues": [
+            "Too many connections — check max_connections and connection leaks",
+            "Slow queries — enable slow_query_log, check long_query_time",
+            "Galera cluster split-brain — check wsrep_cluster_size",
+            "Disk space full — purge binary logs, check tmpdir",
+        ],
+        "useful_commands": [
+            "mariadb-admin status",
+            "mariadb-admin processlist",
+            "mariadb -e 'SHOW GLOBAL STATUS'",
+            "systemctl status mariadb",
+            "du -sh /var/lib/mysql/",
+        ],
+        "doc_url": "https://mariadb.com/kb/en/documentation/",
+    },
+    "php-fpm": {
+        "config_paths": [
+            "/etc/php/*/fpm/php-fpm.conf",
+            "/etc/php/*/fpm/pool.d/",
+            "/etc/php/*/fpm/php.ini",
+            "/opt/cpanel/ea-php*/root/etc/php-fpm.d/",
+        ],
+        "common_issues": [
+            "502 from Nginx — FPM not running or socket path mismatch",
+            "Pool saturated — max_children too low for traffic, children in 'Idle' state pile up",
+            "OOM kills — pm.max_children * memory_per_process exceeds available RAM",
+            "Slow scripts — check request_slowlog_timeout output",
+            "OPcache stale — restart FPM or set opcache.validate_timestamps=1 in dev",
+        ],
+        "useful_commands": [
+            "systemctl status php*-fpm",
+            "php -v",
+            "php -i | head -50",
+            "php -m",  # loaded modules
+            "ls /var/run/php/",
+            "cat /etc/php/*/fpm/pool.d/www.conf | grep -E '^(pm\\.|listen)'",
+        ],
+        "doc_url": "https://www.php.net/manual/en/install.fpm.php",
+    },
+    "redis": {
+        "config_paths": [
+            "/etc/redis/redis.conf",
+            "/etc/redis.conf",
+            "/etc/redis/sentinel.conf",
+        ],
+        "common_issues": [
+            "Max memory reached — eviction policy kicks in, check maxmemory-policy",
+            "High latency — check slowlog, disable THP, check persistence settings",
+            "Connection refused — check bind address, protected-mode, and requirepass",
+            "RDB/AOF save failures — check disk space and permissions on dump path",
+            "Too many connections — check maxclients and client list",
+        ],
+        "useful_commands": [
+            "redis-cli ping",
+            "redis-cli info",
+            "redis-cli info memory",
+            "redis-cli info clients",
+            "redis-cli slowlog get 10",
+            "redis-cli dbsize",
+            "systemctl status redis || systemctl status redis-server",
+        ],
+        "doc_url": "https://redis.io/docs/",
+    },
+    "docker": {
+        "config_paths": [
+            "/etc/docker/daemon.json",
+            "~/.docker/config.json",
+            "/var/lib/docker/",
+        ],
+        "common_issues": [
+            "Disk space exhaustion — prune unused images/containers/volumes",
+            "Container OOM killed — check docker inspect for OomKilled, raise memory limit",
+            "Network conflicts — overlapping subnets between Docker and host",
+            "DNS resolution failure in containers — check /etc/docker/daemon.json dns setting",
+            "Permission denied on bind mount — SELinux :Z flag or user namespace mapping",
+        ],
+        "useful_commands": [
+            "docker ps -a",
+            "docker stats --no-stream",
+            "docker system df",
+            "docker network ls",
+            "docker logs --tail 50 <container>",
+            "docker compose ps",
+            "docker compose logs --tail 50",
+            "journalctl -u docker --since '1 hour ago'",
+        ],
+        "doc_url": "https://docs.docker.com/",
+    },
+    "pterodactyl": {
+        "config_paths": [
+            "/var/www/pterodactyl/.env",
+            "/etc/pterodactyl/config.yml",
+            "/var/www/pterodactyl/storage/logs/laravel.log",
+        ],
+        "common_issues": [
+            "Wings not connecting — check FQDN, SSL cert, and node config in panel",
+            "Server stuck installing — check Wings logs and egg install script",
+            "File manager 404 — Nginx/Apache rewrite rules missing for panel",
+            "Allocation port conflict — check if port is already in use on the node",
+            "Queue worker not running — check systemd pteroq.service",
+        ],
+        "useful_commands": [
+            "systemctl status pteroq",
+            "systemctl status wings",
+            "tail -n 50 /var/www/pterodactyl/storage/logs/laravel.log",
+            "tail -n 50 /var/log/pterodactyl/wings.log",
+            "php /var/www/pterodactyl/artisan queue:work --once",
+            "php /var/www/pterodactyl/artisan up",
+        ],
+        "doc_url": "https://pterodactyl.io/project/introduction.html",
+    },
+    "saltbox": {
+        "config_paths": [
+            "/srv/git/saltbox/accounts.yml",
+            "/srv/git/saltbox/settings.yml",
+            "/srv/git/saltbox/adv_settings.yml",
+            "/opt/saltbox/",
+        ],
+        "common_issues": [
+            "Cloudflare DNS not updating — check API key in accounts.yml",
+            "Rclone mount failure — check rclone.conf and mount service",
+            "Traefik not routing — check labels on Docker containers",
+            "Plex not accessible — check claim token, port mapping, and Traefik config",
+            "Backup failure — check /opt/saltbox logs and available disk space",
+        ],
+        "useful_commands": [
+            "sb list",
+            "sb status",
+            "systemctl status rclone_vfs",
+            "systemctl status mergerfs",
+            "docker ps --format 'table {{.Names}}\t{{.Status}}'",
+            "rclone lsd remote:",
+            "cat /srv/git/saltbox/settings.yml",
+        ],
+        "doc_url": "https://docs.saltbox.dev/",
+    },
+    "litespeed": {
+        "config_paths": [
+            "/usr/local/lsws/conf/httpd_config.conf",
+            "/usr/local/lsws/conf/vhosts/",
+            "/usr/local/lsws/admin/conf/admin_config.conf",
+        ],
+        "common_issues": [
+            "License expired — check /usr/local/lsws/conf/license.key",
+            ".htaccess rewrite differences — LiteSpeed interprets some rules differently than Apache",
+            "Cache not working — check LSCache plugin settings and response headers",
+            "Admin panel inaccessible — check listener on port 7080",
+            "High CPU from lsphp — check max_children and PHP process limits",
+        ],
+        "useful_commands": [
+            "/usr/local/lsws/bin/lswsctrl status",
+            "/usr/local/lsws/bin/lswsctrl restart",
+            "tail -n 50 /usr/local/lsws/logs/error.log",
+            "tail -n 50 /usr/local/lsws/logs/access.log",
+            "ls /tmp/lshttpd/",
+            "curl -I -H 'Host: example.com' http://127.0.0.1",
+        ],
+        "doc_url": "https://docs.litespeedtech.com/lsws/",
+    },
+    "certbot": {
+        "config_paths": [
+            "/etc/letsencrypt/",
+            "/etc/letsencrypt/renewal/",
+            "/etc/letsencrypt/live/",
+        ],
+        "common_issues": [
+            "Renewal failing — check HTTP-01 challenge accessibility on port 80",
+            "Rate limited — too many cert requests; check with --dry-run first",
+            "DNS challenge failure — TXT record not propagated or API credentials wrong",
+            "Cert expired — check certbot renew --dry-run and cron/systemd timer",
+            "Wrong cert served — check Nginx/Apache SNI config and cert path",
+        ],
+        "useful_commands": [
+            "certbot certificates",
+            "certbot renew --dry-run",
+            "openssl x509 -in /etc/letsencrypt/live/DOMAIN/cert.pem -text -noout | head -20",
+            "openssl s_client -connect DOMAIN:443 -servername DOMAIN </dev/null 2>/dev/null | openssl x509 -noout -dates",
+            "systemctl list-timers | grep certbot",
+        ],
+        "doc_url": "https://eff-certbot.readthedocs.io/en/stable/",
+    },
+}
+
+# Allow lookup by common aliases
+_ALIASES = {
+    "wp": "wordpress",
+    "whm": "cpanel",
+    "cpanel/whm": "cpanel",
+    "httpd": "apache",
+    "mysql/mariadb": "mysql",
+    "fpm": "php-fpm",
+    "phpfpm": "php-fpm",
+    "php_fpm": "php-fpm",
+    "letsencrypt": "certbot",
+    "let's encrypt": "certbot",
+    "lsws": "litespeed",
+    "openlitespeed": "litespeed",
+    "ols": "litespeed",
+}
+
+
+class DocFetcher:
+    def get_context(self, software_name):
+        key = software_name.lower().strip()
+        key = _ALIASES.get(key, key)
+        entry = SOFTWARE_DB.get(key)
+        if entry is None:
+            return None
+        return dict(entry)
+
+    def get_all_known(self):
+        return sorted(SOFTWARE_DB.keys())
