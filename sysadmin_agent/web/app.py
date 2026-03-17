@@ -106,6 +106,8 @@ _session_data: dict[str, dict] = {}
 _conversations: dict[str, list] = {}
 # approval_id -> threading.Event + result dict
 _pending_approvals: dict[str, dict] = {}
+# sid -> AgentBrain (persistent per session for token tracking)
+_brains: dict[str, object] = {}
 
 APPROVAL_TIMEOUT = 60  # seconds
 
@@ -271,6 +273,14 @@ def _get_conversation(sid: str) -> list:
     if sid not in _conversations:
         _conversations[sid] = []
     return _conversations[sid]
+
+
+def _get_brain(sid: str):
+    """Return a session-persistent AgentBrain so token usage accumulates."""
+    if sid not in _brains:
+        mods = _import_agent_modules()
+        _brains[sid] = mods["AgentBrain"]()
+    return _brains[sid]
 
 
 def _build_server_context(sid: str) -> dict:
@@ -494,11 +504,14 @@ def setup_configure():
 @app.route("/api/profiles", methods=["GET"])
 @_require_auth
 def list_profiles():
-    """Return all saved server profiles as a JSON array."""
+    """Return all saved server profiles as a JSON array.
+    Never expose the obfuscated password to the frontend listing."""
     result = []
     for name, prof in server_profiles.items():
         entry = dict(prof) if isinstance(prof, dict) else {}
         entry.setdefault("name", name)
+        # Remove the obfuscated password from the listing
+        entry.pop("password_obf", None)
         result.append(entry)
     return jsonify(result)
 
@@ -513,11 +526,114 @@ def save_profile():
     if not name:
         return jsonify({"error": "Profile name is required"}), 400
 
-    server_profiles[name] = {
-        k: v for k, v in data.items() if k != "name"
-    }
+    # Build profile data, handling password obfuscation
+    profile_data = {}
+    for k, v in data.items():
+        if k in ("name", "password"):
+            continue
+        profile_data[k] = v
+
+    # Handle password saving (obfuscated, not plaintext)
+    if data.get("save_password") and data.get("password"):
+        import base64
+        profile_data["password_saved"] = True
+        profile_data["password_obf"] = base64.b64encode(
+            data["password"].encode("utf-8")
+        ).decode("ascii")
+    elif data.get("auth_type") == "password":
+        profile_data["password_required"] = True
+
+    server_profiles[name] = profile_data
     _save_config(server_profiles)
     return jsonify({"status": "ok", "name": name})
+
+
+@app.route("/api/profiles/setup-ssh-key", methods=["POST"])
+@_require_auth
+def setup_ssh_key():
+    """Generate an SSH key pair and install the public key on the remote server.
+    Requires an active SSH connection (password-based) to copy the key."""
+    data = request.get_json(force=True)
+    profile_name = data.get("profile_name", "").strip()
+    if not profile_name:
+        return jsonify({"error": "Profile name is required"}), 400
+
+    try:
+        import tempfile
+        import paramiko
+
+        # Generate a new RSA key pair
+        key = paramiko.RSAKey.generate(4096)
+
+        # Save private key
+        key_dir = PROJECT_ROOT / "ssh_keys"
+        key_dir.mkdir(exist_ok=True)
+        safe_name = "".join(c if c.isalnum() or c in "-_" else "_" for c in profile_name)
+        key_path = key_dir / f"id_rsa_{safe_name}"
+        key.write_private_key_file(str(key_path))
+        key_path.chmod(0o600)
+
+        # Get public key string
+        pub_key = f"ssh-rsa {key.get_base64()} sysadmin-agent-{safe_name}"
+
+        # Try to install the key on the remote server using existing connection
+        # Find the profile to get connection details
+        prof = server_profiles.get(profile_name)
+        if not prof or not isinstance(prof, dict):
+            return jsonify({"error": "Profile not found"}), 404
+
+        host = prof.get("host")
+        port = int(prof.get("port", 22))
+        username = prof.get("username", "")
+
+        # Get password from the request or from saved profile
+        password = data.get("password")
+        if not password:
+            import base64 as b64
+            obf = prof.get("password_obf")
+            if obf:
+                password = b64.b64decode(obf.encode("ascii")).decode("utf-8")
+
+        if not password:
+            return jsonify({"error": "Password required to install SSH key"}), 400
+
+        # Connect and install the key
+        client = paramiko.SSHClient()
+        client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        client.connect(hostname=host, port=port, username=username,
+                       password=password, timeout=15)
+
+        install_cmd = (
+            f'mkdir -p ~/.ssh && chmod 700 ~/.ssh && '
+            f'echo "{pub_key}" >> ~/.ssh/authorized_keys && '
+            f'chmod 600 ~/.ssh/authorized_keys'
+        )
+        stdin, stdout, stderr = client.exec_command(install_cmd)
+        exit_code = stdout.channel.recv_exit_status()
+        client.close()
+
+        if exit_code != 0:
+            err = stderr.read().decode("utf-8", errors="replace")
+            return jsonify({"error": f"Failed to install key: {err}"}), 500
+
+        # Update profile to use key auth
+        prof["auth_type"] = "key"
+        prof["key_path"] = str(key_path)
+        prof.pop("password_obf", None)
+        prof.pop("password_saved", None)
+        prof.pop("password_required", None)
+        server_profiles[profile_name] = prof
+        _save_config(server_profiles)
+
+        return jsonify({
+            "status": "ok",
+            "key_path": str(key_path),
+            "message": f"SSH key generated and installed. Profile updated to key auth.",
+        })
+
+    except Exception as exc:
+        logger.exception("setup_ssh_key failed")
+        return jsonify({"error": str(exc)}), 500
 
 
 @app.route("/api/profiles/<name>", methods=["DELETE"])
@@ -592,6 +708,7 @@ def handle_disconnect():
             pass
     _session_data.pop(sid, None)
     _conversations.pop(sid, None)
+    _brains.pop(sid, None)
 
 
 @socketio.on("connect_server")
@@ -610,6 +727,22 @@ def handle_connect_server(data):
         password = data.get("password")
         private_key_path = data.get("private_key_path") or data.get("key_path")
         passphrase = data.get("passphrase")
+
+        # If no password provided, check if there's a saved one in profiles
+        if not password and not private_key_path:
+            import base64
+            for _pname, prof in server_profiles.items():
+                if (isinstance(prof, dict)
+                        and prof.get("host") == host
+                        and prof.get("username", "") == username
+                        and prof.get("password_obf")):
+                    try:
+                        password = base64.b64decode(
+                            prof["password_obf"].encode("ascii")
+                        ).decode("utf-8")
+                    except Exception:
+                        pass
+                    break
 
         emit("status", {"message": f"Connecting to {host}:{port}..."})
 
@@ -670,6 +803,7 @@ def handle_disconnect_server(data=None):
             pass
     _session_data.pop(sid, None)
     _conversations.pop(sid, None)
+    _brains.pop(sid, None)
     emit("server_disconnected", {"message": "Disconnected from server."})
 
 
@@ -764,7 +898,7 @@ def handle_ask_agent(data):
 
         emit("status", {"message": "Thinking..."})
 
-        brain = mods["AgentBrain"]()
+        brain = _get_brain(sid)
         ctx = _build_server_context(sid)
 
         # If there is prior conversation context, include it
@@ -782,15 +916,16 @@ def handle_ask_agent(data):
         if plan.get("questions"):
             return
 
-        # Execute plan steps (non-destructive ones auto-run, destructive need approval)
-        auto_execute = data.get("auto_execute", False)
-        if not auto_execute:
+        # Always auto-execute plans: non-destructive steps run automatically,
+        # destructive steps require approval via the web UI.
+        steps = plan.get("plan", [])
+        if not steps:
             return
 
         approval = WebApprovalManager(sid)
         rollback = mods["RollbackManager"](ssh)
 
-        for step in plan.get("plan", []):
+        for step in steps:
             command = step.get("command")
             if not command:
                 emit("step_result", {

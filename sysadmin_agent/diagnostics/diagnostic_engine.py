@@ -319,12 +319,36 @@ class DiagnosticEngine:
         output = result["stdout"].strip()
         if output:
             lines = [l for l in output.splitlines() if l.strip()]
+
+            # Try to extract killed process names for better details
+            killed_procs = set()
+            for line in lines:
+                # Common OOM log patterns: "Killed process <pid> (<name>)"
+                match = re.search(r'Killed process \d+ \(([^)]+)\)', line)
+                if match:
+                    killed_procs.add(match.group(1))
+
+            details = f"Found {len(lines)} OOM event(s)"
+            if killed_procs:
+                details += f" — killed processes: {', '.join(sorted(killed_procs))}"
+            details += ":\n" + "\n".join(lines)
+
             return {
                 "name": "check_oom_kills",
-                "status": "info",
-                "severity": "medium",
-                "details": f"Found {len(lines)} OOM event(s):\n" + "\n".join(lines),
-                "fix": None,
+                "status": "warning",
+                "severity": "high",
+                "details": details,
+                "fix": [
+                    {"command": "ps aux --sort=-%mem | head -20",
+                     "description": "Show current top memory-consuming processes",
+                     "destructive": False},
+                    {"command": "free -h && cat /proc/meminfo | grep -E 'MemTotal|MemFree|MemAvailable|SwapTotal|SwapFree'",
+                     "description": "Show detailed memory and swap status",
+                     "destructive": False},
+                    {"command": "journalctl -k --no-pager -g 'oom' --since '7 days ago' 2>/dev/null | head -30",
+                     "description": "Show OOM events from the past 7 days",
+                     "destructive": False},
+                ],
             }
 
         return self._ok("check_oom_kills", "No OOM kills detected")

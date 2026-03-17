@@ -752,13 +752,18 @@ function connectServer(e) {
     if (!socket) initSocket();
 
     const authType = $('#authType')?.value || 'password';
+    const pwField = $('#sshPassword');
+    const enteredPassword = pwField?.value || '';
+    // If no password typed but profile has a saved one, the backend will look it up
+    const password = authType === 'password' ? enteredPassword : undefined;
+
     const payload = {
         host: $('#host')?.value,
         port: parseInt($('#port')?.value || '22'),
         username: $('#username')?.value,
-        password: authType === 'password' ? $('#sshPassword')?.value : undefined,
-        key_path: authType === 'key' ? $('#keyPath')?.value : undefined,
-        passphrase: authType === 'key' ? $('#passphrase')?.value : undefined,
+        password: password || undefined,
+        key_path: authType === 'key' ? ($('#keyPath')?.value || undefined) : undefined,
+        passphrase: authType === 'key' ? ($('#passphrase')?.value || undefined) : undefined,
     };
 
     setConnectionStatus('connecting', 'Connecting...');
@@ -891,6 +896,17 @@ function loadProfile() {
     }
     if (profile.key_path && $('#keyPath')) $('#keyPath').value = profile.key_path;
 
+    // If password is saved in the profile, set a placeholder indicator
+    if (profile.password_saved && $('#sshPassword')) {
+        $('#sshPassword').value = '';
+        $('#sshPassword').placeholder = '(saved in profile)';
+        // Store a flag so connectServer knows to use the saved password
+        $('#sshPassword').dataset.savedPassword = 'true';
+    } else if ($('#sshPassword')) {
+        $('#sshPassword').placeholder = 'Server password';
+        delete $('#sshPassword').dataset.savedPassword;
+    }
+
     showFlash('Profile loaded', 'success');
 }
 
@@ -899,6 +915,7 @@ async function saveProfile() {
     if (!name) return;
 
     const authType = $('#authType')?.value || 'password';
+    const password = $('#sshPassword')?.value || '';
     const payload = {
         name,
         host: $('#host')?.value,
@@ -907,6 +924,17 @@ async function saveProfile() {
         auth_type: authType,
         key_path: authType === 'key' ? ($('#keyPath')?.value || '') : '',
     };
+
+    // If password auth and a password is entered, ask about saving it
+    if (authType === 'password' && password) {
+        const saveChoice = await showPasswordSaveDialog(name, password);
+        if (saveChoice === 'save') {
+            payload.password = password;
+            payload.save_password = true;
+        }
+        // 'ssh_key' choice is handled inside showPasswordSaveDialog
+        // 'skip' means save profile without password
+    }
 
     try {
         const res = await fetch('/api/profiles', {
@@ -922,6 +950,84 @@ async function saveProfile() {
         }
     } catch (e) {
         showFlash('Error saving profile', 'error');
+    }
+}
+
+/**
+ * Show a dialog asking the user about password storage security.
+ * Returns: 'save' | 'ssh_key' | 'skip'
+ */
+function showPasswordSaveDialog(profileName, password) {
+    return new Promise((resolve) => {
+        // Remove any existing dialog
+        const existing = document.getElementById('passwordSaveDialog');
+        if (existing) existing.remove();
+
+        const overlay = document.createElement('div');
+        overlay.id = 'passwordSaveDialog';
+        overlay.style.cssText = 'position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,0.6);z-index:10000;display:flex;align-items:center;justify-content:center;';
+
+        const dialog = document.createElement('div');
+        dialog.style.cssText = 'background:var(--bg-secondary,#1e1e2e);border:1px solid var(--border,#333);border-radius:12px;padding:24px;max-width:480px;width:90%;color:var(--text-primary,#cdd6f4);';
+        dialog.innerHTML = `
+            <h3 style="margin:0 0 12px;color:var(--warning,#f9e2af);">Save Password?</h3>
+            <p style="margin:0 0 16px;font-size:14px;line-height:1.5;color:var(--text-secondary,#a6adc8);">
+                Saving your password stores it in the config file with basic obfuscation (base64).
+                <strong style="color:var(--danger,#f38ba8);">This is NOT secure encryption</strong> —
+                anyone with access to the config file can decode it.
+            </p>
+            <p style="margin:0 0 20px;font-size:14px;line-height:1.5;color:var(--text-secondary,#a6adc8);">
+                For better security, you can set up an SSH key instead. This will generate a key pair
+                and automatically install it on the server.
+            </p>
+            <div style="display:flex;gap:8px;flex-wrap:wrap;">
+                <button id="pwdSaveBtn" class="btn btn-primary" style="flex:1;min-width:120px;">Save Password</button>
+                <button id="pwdKeyBtn" class="btn btn-success" style="flex:1;min-width:120px;">Setup SSH Key</button>
+                <button id="pwdSkipBtn" class="btn btn-secondary" style="flex:1;min-width:120px;">Don't Save</button>
+            </div>
+        `;
+
+        overlay.appendChild(dialog);
+        document.body.appendChild(overlay);
+
+        document.getElementById('pwdSaveBtn').onclick = () => { overlay.remove(); resolve('save'); };
+        document.getElementById('pwdKeyBtn').onclick = () => { overlay.remove(); setupSSHKey(profileName, password); resolve('skip'); };
+        document.getElementById('pwdSkipBtn').onclick = () => { overlay.remove(); resolve('skip'); };
+    });
+}
+
+/**
+ * Set up SSH key authentication for a profile.
+ * Generates a key pair on the backend and installs it on the remote server.
+ */
+async function setupSSHKey(profileName, password) {
+    showFlash('Setting up SSH key...', 'info');
+
+    try {
+        const res = await fetch('/api/profiles/setup-ssh-key', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ profile_name: profileName, password }),
+        });
+        const data = await res.json();
+
+        if (res.ok) {
+            showFlash(data.message || 'SSH key installed successfully!', 'success');
+            // Reload profiles to reflect the auth_type change
+            await loadProfiles();
+            // Update the form to show key auth
+            if ($('#authType')) {
+                $('#authType').value = 'key';
+                toggleAuthFields();
+            }
+            if ($('#keyPath') && data.key_path) {
+                $('#keyPath').value = data.key_path;
+            }
+        } else {
+            showFlash('SSH key setup failed: ' + (data.error || 'Unknown error'), 'error');
+        }
+    } catch (e) {
+        showFlash('SSH key setup error: ' + e.message, 'error');
     }
 }
 
