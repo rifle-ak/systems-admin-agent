@@ -1,3 +1,4 @@
+import base64
 import json
 from pathlib import Path
 
@@ -8,8 +9,27 @@ class ProfileManager:
         self._profiles = {}
         self._load()
 
+    @staticmethod
+    def _obfuscate(value):
+        """Base64-encode a string for basic obfuscation in config files.
+        This is NOT encryption — it only prevents casual shoulder-surfing."""
+        if not value:
+            return None
+        return base64.b64encode(value.encode("utf-8")).decode("ascii")
+
+    @staticmethod
+    def _deobfuscate(value):
+        """Decode a base64-obfuscated string."""
+        if not value:
+            return None
+        try:
+            return base64.b64decode(value.encode("ascii")).decode("utf-8")
+        except Exception:
+            return value  # Return as-is if not valid base64
+
     def save_profile(self, name, host, username, port=22, auth_type="key",
-                     password=None, key_path=None, passphrase=None, notes=None):
+                     password=None, key_path=None, passphrase=None, notes=None,
+                     save_password=False):
         profile = {
             "name": name,
             "host": host,
@@ -20,7 +40,11 @@ class ProfileManager:
         }
 
         if auth_type == "password":
-            profile["password_required"] = True
+            if save_password and password:
+                profile["password_saved"] = True
+                profile["password_obf"] = self._obfuscate(password)
+            else:
+                profile["password_required"] = True
         elif auth_type == "key":
             profile["key_path"] = key_path
             if passphrase:
@@ -34,15 +58,19 @@ class ProfileManager:
         return self._profiles.get(name)
 
     def list_profiles(self):
-        return [
-            {
+        result = []
+        for p in self._profiles.values():
+            entry = {
                 "name": p["name"],
                 "host": p["host"],
                 "username": p["username"],
                 "auth_type": p["auth_type"],
+                "port": p.get("port", 22),
+                "key_path": p.get("key_path", ""),
+                "password_saved": p.get("password_saved", False),
             }
-            for p in self._profiles.values()
-        ]
+            result.append(entry)
+        return result
 
     def delete_profile(self, name):
         if name not in self._profiles:
@@ -57,6 +85,16 @@ class ProfileManager:
         self._profiles[name].update(kwargs)
         self._save()
         return self._profiles[name]
+
+    def get_saved_password(self, name):
+        """Return the deobfuscated password for a profile, or None."""
+        profile = self.get_profile(name)
+        if not profile:
+            return None
+        obf = profile.get("password_obf")
+        if obf:
+            return self._deobfuscate(obf)
+        return None
 
     def to_ssh_kwargs(self, name):
         profile = self.get_profile(name)
@@ -73,7 +111,9 @@ class ProfileManager:
             if profile.get("key_path"):
                 kwargs["private_key_path"] = profile["key_path"]
         elif profile["auth_type"] == "password":
-            kwargs["password"] = None
+            # Return saved password if available
+            obf = profile.get("password_obf")
+            kwargs["password"] = self._deobfuscate(obf) if obf else None
 
         return kwargs
 
