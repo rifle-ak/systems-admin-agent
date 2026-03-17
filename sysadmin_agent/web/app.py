@@ -88,7 +88,7 @@ app = Flask(
     template_folder=str(Path(__file__).resolve().parent / "templates"),
     static_folder=str(Path(__file__).resolve().parent / "static"),
 )
-app.secret_key = os.environ.get("SECRET_KEY", secrets.token_hex(32))
+app.secret_key = os.environ.get("SECRET_KEY") or secrets.token_hex(32)
 
 socketio = SocketIO(app, cors_allowed_origins="*", async_mode="threading")
 
