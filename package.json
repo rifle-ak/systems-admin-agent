@@ -1,0 +1,31 @@
+{
+  "name": "systems-admin-agent",
+  "version": "1.0.0",
+  "description": "SSH-based systems administration agent with auto-diagnosis, application discovery, and safe rollback capabilities",
+  "main": "src/index.js",
+  "bin": {
+    "sysadmin-agent": "./src/index.js"
+  },
+  "scripts": {
+    "start": "node src/index.js",
+    "test": "node --test tests/*.test.js"
+  },
+  "keywords": [
+    "ssh",
+    "sysadmin",
+    "server-management",
+    "diagnostics"
+  ],
+  "license": "MIT",
+  "dependencies": {
+    "ssh2": "^1.16.0",
+    "chalk": "^4.1.2",
+    "inquirer": "^8.2.6",
+    "cli-table3": "^0.6.5",
+    "ora": "^5.4.1",
+    "commander": "^12.1.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
