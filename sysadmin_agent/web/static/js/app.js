@@ -277,7 +277,7 @@ function updateProgress(text) {
     const existingId = 'progress-msg';
     let el = document.getElementById(existingId);
     if (!el) {
-        el = addMessage('agent', `<span id="progress-text">${escapeHtml(text)}</span>`, { id: existingId });
+        el = addMessage('agent', `<span class="progress-indicator"><span class="progress-spinner"></span> <span id="progress-text">${escapeHtml(text)}</span></span>`, { id: existingId });
     } else {
         const textEl = el.querySelector('#progress-text');
         if (textEl) textEl.textContent = text;
@@ -935,6 +935,34 @@ function loadProfile() {
         delete $('#sshPassword').dataset.savedPassword;
     }
 
+    // Rust admin fields
+    if (profile.rcon_host && $('#rconHost')) $('#rconHost').value = profile.rcon_host;
+    if (profile.rcon_port && $('#rconPort')) $('#rconPort').value = profile.rcon_port;
+    if (profile.rcon_password_saved && $('#rconPassword')) {
+        $('#rconPassword').value = '';
+        $('#rconPassword').placeholder = '(saved in profile)';
+        $('#rconPassword').dataset.savedPassword = 'true';
+    } else if ($('#rconPassword')) {
+        $('#rconPassword').placeholder = 'RCON password';
+        delete $('#rconPassword').dataset.savedPassword;
+    }
+
+    if (profile.ptero_url && $('#pteroUrl')) $('#pteroUrl').value = profile.ptero_url;
+    if (profile.ptero_server_id && $('#pteroServerId')) $('#pteroServerId').value = profile.ptero_server_id;
+    if (profile.ptero_api_key_saved && $('#pteroApiKey')) {
+        $('#pteroApiKey').value = '';
+        $('#pteroApiKey').placeholder = '(saved in profile)';
+        $('#pteroApiKey').dataset.savedPassword = 'true';
+    } else if ($('#pteroApiKey')) {
+        $('#pteroApiKey').placeholder = 'API key (ptlc_...)';
+        delete $('#pteroApiKey').dataset.savedPassword;
+    }
+
+    // Show Rust admin panel if profile has Rust data
+    if ((profile.rcon_host || profile.ptero_url) && $('#rustAdmin')) {
+        $('#rustAdmin').style.display = 'block';
+    }
+
     showFlash('Profile loaded', 'success');
 }
 
@@ -952,6 +980,21 @@ async function saveProfile() {
         auth_type: authType,
         key_path: authType === 'key' ? ($('#keyPath')?.value || '') : '',
     };
+
+    // Include Rust admin credentials if filled in
+    const rconHost = $('#rconHost')?.value || '';
+    const rconPort = $('#rconPort')?.value || '';
+    const rconPassword = $('#rconPassword')?.value || '';
+    const pteroUrl = $('#pteroUrl')?.value || '';
+    const pteroApiKey = $('#pteroApiKey')?.value || '';
+    const pteroServerId = $('#pteroServerId')?.value || '';
+
+    if (rconHost) payload.rcon_host = rconHost;
+    if (rconPort) payload.rcon_port = parseInt(rconPort);
+    if (rconPassword) payload.rcon_password = rconPassword;
+    if (pteroUrl) payload.ptero_url = pteroUrl;
+    if (pteroApiKey) payload.ptero_api_key = pteroApiKey;
+    if (pteroServerId) payload.ptero_server_id = pteroServerId;
 
     // If password auth and a password is entered, ask about saving it
     if (authType === 'password' && password) {
@@ -1437,12 +1480,22 @@ function connectRcon() {
     const host = ($('#rconHost') || {}).value || '';
     const port = ($('#rconPort') || {}).value || '28016';
     const password = ($('#rconPassword') || {}).value || '';
-    if (!host || !password) {
+    const useSaved = !password && $('#rconPassword')?.dataset.savedPassword === 'true';
+    if (!host || (!password && !useSaved)) {
         showFlash('RCON host and password are required', 'error');
         return;
     }
-    addMessage('system', 'Connecting to RCON...');
-    socket.emit('rust_connect_rcon', { host, port: parseInt(port), password });
+    updateProgress('Connecting to RCON...');
+    const payload = { host, port: parseInt(port) };
+    if (password) {
+        payload.password = password;
+    } else if (useSaved) {
+        payload.use_saved_password = true;
+        // Include profile name so backend can look up the saved password
+        const profileSelect = $('#profileSelect');
+        if (profileSelect?.value) payload.profile_name = profileSelect.value;
+    }
+    socket.emit('rust_connect_rcon', payload);
 }
 
 function disconnectRcon() {
@@ -1453,12 +1506,21 @@ function connectPtero() {
     const baseUrl = ($('#pteroUrl') || {}).value || '';
     const apiKey = ($('#pteroApiKey') || {}).value || '';
     const serverId = ($('#pteroServerId') || {}).value || '';
-    if (!baseUrl || !apiKey) {
+    const useSaved = !apiKey && $('#pteroApiKey')?.dataset.savedPassword === 'true';
+    if (!baseUrl || (!apiKey && !useSaved)) {
         showFlash('Panel URL and API key are required', 'error');
         return;
     }
-    addMessage('system', 'Connecting to Pterodactyl Panel...');
-    socket.emit('rust_connect_pterodactyl', { base_url: baseUrl, api_key: apiKey, server_id: serverId });
+    updateProgress('Connecting to Pterodactyl Panel...');
+    const payload = { base_url: baseUrl, server_id: serverId };
+    if (apiKey) {
+        payload.api_key = apiKey;
+    } else if (useSaved) {
+        payload.use_saved_key = true;
+        const profileSelect = $('#profileSelect');
+        if (profileSelect?.value) payload.profile_name = profileSelect.value;
+    }
+    socket.emit('rust_connect_pterodactyl', payload);
 }
 
 function disconnectPtero() {
@@ -1466,6 +1528,7 @@ function disconnectPtero() {
 }
 
 function onRconConnected(data) {
+    removeMessage('progress-msg');
     rconConnected = true;
     if ($('#rconForm')) $('#rconForm').style.display = 'none';
     if ($('#rconConnected')) $('#rconConnected').style.display = 'flex';
@@ -1489,6 +1552,7 @@ function onRconDisconnected() {
 }
 
 function onPteroConnected(data) {
+    removeMessage('progress-msg');
     pteroConnected = true;
     if ($('#pteroForm')) $('#pteroForm').style.display = 'none';
     if ($('#pteroConnected')) $('#pteroConnected').style.display = 'flex';
@@ -1529,23 +1593,24 @@ function onRconResponse(data) {
 }
 
 function rustAction(action) {
-    addMessage('system', `Running: ${action}...`);
+    updateProgress(`Running: ${action}...`);
     socket.emit('rust_quick_action', { action });
 }
 
 function onRustActionResult(data) {
+    removeMessage('progress-msg');
     const action = data.action || 'action';
     const result = typeof data.result === 'string' ? data.result : JSON.stringify(data.result, null, 2);
     addMessage('agent', `<strong>${escapeHtml(action)}</strong>\n<pre class="rcon-output">${escapeHtml(result)}</pre>`);
 }
 
 function rustRunDiagnostics() {
-    addMessage('system', 'Running Rust server diagnostics...');
+    updateProgress('Running Rust server diagnostics...');
     socket.emit('rust_run_diagnostics', {});
 }
 
 function rustDiagnoseLag() {
-    addMessage('system', 'Diagnosing lag and rubber-banding...');
+    updateProgress('Diagnosing lag and rubber-banding...');
     socket.emit('rust_diagnose_lag', {});
 }
 
@@ -1615,6 +1680,7 @@ function onRustPluginResult(data) {
 }
 
 function onRustPteroResult(data) {
+    removeMessage('progress-msg');
     const action = data.action || '';
     const result = typeof data.result === 'string' ? data.result : JSON.stringify(data.result, null, 2);
     addMessage('agent', `<strong>Pterodactyl: ${escapeHtml(action)}</strong>\n<pre class="rcon-output">${escapeHtml(result)}</pre>`);

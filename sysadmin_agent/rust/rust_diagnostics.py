@@ -34,11 +34,13 @@ class RustServerDiagnostics:
         results = diag.run_all()
     """
 
-    def __init__(self, rcon=None, ptero=None, server_id=None, ssh=None):
+    def __init__(self, rcon=None, ptero=None, server_id=None, ssh=None,
+                 on_progress=None):
         self.rcon = rcon
         self.ptero = ptero
         self.server_id = server_id
         self.ssh = ssh
+        self._on_progress = on_progress  # callback(message_str)
 
         self._checks = [
             self.check_server_fps,
@@ -61,9 +63,20 @@ class RustServerDiagnostics:
             self.check_memory_leak_indicators,
         ]
 
+    def _progress(self, message):
+        """Emit a progress update if a callback is registered."""
+        if self._on_progress:
+            try:
+                self._on_progress(message)
+            except Exception:
+                pass
+
     def run_all(self) -> list:
         """Run all applicable diagnostic checks."""
         results = []
+        total = len(self._checks)
+        completed = 0
+        self._progress(f"Starting diagnostics — {total} checks queued...")
         # Use fewer workers since RCON is single-threaded
         with ThreadPoolExecutor(max_workers=3) as executor:
             futures = {
@@ -72,6 +85,9 @@ class RustServerDiagnostics:
             }
             for future in as_completed(futures):
                 name = futures[future]
+                completed += 1
+                friendly = name.replace("check_", "").replace("_", " ").title()
+                self._progress(f"[{completed}/{total}] {friendly}...")
                 try:
                     result = future.result()
                     if result:  # Skip None results from inapplicable checks
@@ -96,6 +112,7 @@ class RustServerDiagnostics:
         findings = []
 
         # 1. Check tick rate — #1 cause of rubber-banding
+        self._progress("[1/5] Checking server tick rate (FPS)...")
         fps_result = self._safe_rcon("fps")
         if fps_result:
             fps_val = self._parse_fps(fps_result)
@@ -120,6 +137,7 @@ class RustServerDiagnostics:
                     })
 
         # 2. Check entity count — #2 cause
+        self._progress("[2/5] Checking entity count...")
         entity_result = self._safe_rcon("entity.count")
         if entity_result:
             count = self._parse_entity_count(entity_result)
@@ -142,6 +160,7 @@ class RustServerDiagnostics:
                     })
 
         # 3. Check server resources via Pterodactyl
+        self._progress("[3/5] Checking server resources...")
         if self.ptero and self.server_id:
             try:
                 resources = self.ptero.get_resources(self.server_id)
@@ -175,6 +194,7 @@ class RustServerDiagnostics:
                 logger.warning("Resource check failed: %s", e)
 
         # 4. Check for plugin lag
+        self._progress("[4/5] Checking plugin performance...")
         perf_result = self._safe_rcon("perf")
         if perf_result:
             slow_hooks = self._parse_perf_hooks(perf_result)
@@ -189,6 +209,7 @@ class RustServerDiagnostics:
                 })
 
         # 5. Network check
+        self._progress("[5/5] Checking network and player pings...")
         status_result = self._safe_rcon("status")
         if status_result:
             high_ping = self._parse_high_ping_players(status_result)
