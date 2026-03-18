@@ -1449,10 +1449,19 @@ def handle_rust_connect_pterodactyl(data):
             resolved_id = servers[0]["identifier"]
 
         _ptero_connections[sid] = {"api": ptero, "server_id": resolved_id}
-        emit("rust_ptero_connected", {
+
+        result = {
             "servers": servers,
             "selected_server": resolved_id,
-        })
+            "client_api": ptero._client_api_available,
+        }
+        if not ptero._client_api_available:
+            result["warning"] = (
+                "Connected with Application API key (ptla_). "
+                "Server management (files, console, power) requires a "
+                "Client API key (ptlc_). Create one under Account > API Credentials."
+            )
+        emit("rust_ptero_connected", result)
     except Exception as exc:
         logger.exception("Pterodactyl connect failed")
         emit("error", {"message": f"Pterodactyl connection failed: {exc}"})

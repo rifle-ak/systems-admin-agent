@@ -1496,8 +1496,14 @@ function onPteroConnected(data) {
     let msg = 'Pterodactyl Panel connected.';
     if (data.servers && data.servers.length > 0) {
         msg += ` Found ${data.servers.length} server(s).`;
+        if (data.selected_server) {
+            msg += ` Selected: ${escapeHtml(data.selected_server)}`;
+        }
     }
     addMessage('system', msg);
+    if (data.warning) {
+        addMessage('system', `⚠️ ${escapeHtml(data.warning)}`);
+    }
 }
 
 function onPteroDisconnected() {

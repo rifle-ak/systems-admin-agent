@@ -51,6 +51,8 @@ class PterodactylAPI:
         self._client_base = f"{self.panel_url}/api/client"
         # Default base depends on key type
         self._base = self._app_base if self._is_application else self._client_base
+        # Detected at runtime by list_servers()
+        self._client_api_available = not self._is_application
 
     # ------------------------------------------------------------------
     # Generic request helpers
@@ -125,18 +127,32 @@ class PterodactylAPI:
     def list_servers(self) -> list:
         """List all servers the API key has access to.
 
-        Always uses the Client API for listing since it returns the short
-        identifier needed for all other Client API calls.
+        Tries Client API first (returns short identifiers needed for most
+        operations).  Falls back to Application API if the key doesn't have
+        client scope.
         """
-        resp = self._get("", use_client=True)
+        # Try Client API first
+        try:
+            resp = self._get("", use_client=True)
+            self._client_api_available = True
+        except PterodactylAPIError as e:
+            if e.status_code in (401, 403):
+                # Client API not available with this key — use Application API
+                resp = self._get("servers")
+                self._client_api_available = False
+            else:
+                raise
+
         data = resp.get("data", [])
         servers = []
         for item in data:
             attrs = item.get("attributes", {})
             servers.append({
-                # Short identifier (e.g. "dd4f6272") — use this for all API calls
+                # Short identifier (e.g. "dd4f6272") — use this for Client API calls
                 "identifier": attrs.get("identifier", ""),
                 "uuid": attrs.get("uuid", ""),
+                # Application API uses numeric "id" instead of "identifier"
+                "internal_id": attrs.get("id", ""),
                 "name": attrs.get("name", ""),
                 "description": attrs.get("description", ""),
                 "status": attrs.get("status"),
@@ -146,14 +162,27 @@ class PterodactylAPI:
             })
         return servers
 
+    def _require_client_api(self, action="this operation"):
+        """Raise a helpful error if Client API is not available."""
+        if not self._client_api_available:
+            raise PterodactylAPIError(
+                f"Cannot {action}: requires a Client API key (ptlc_...). "
+                f"Your Application API key (ptla_) can list servers but cannot "
+                f"manage them. Create a Client API key in the Pterodactyl panel "
+                f"under your Account > API Credentials.",
+                status_code=403,
+            )
+
     def get_server(self, server_id) -> dict:
         """Get details for a specific server (Client API)."""
+        self._require_client_api("get server details")
         resp = self._get(f"/servers/{server_id}", use_client=True)
         return resp.get("attributes", resp)
 
     def get_resources(self, server_id) -> dict:
         """Get current resource usage (CPU, memory, disk, network, uptime).
         This is a Client API endpoint — always routes through /api/client."""
+        self._require_client_api("get server resources")
         resp = self._get(f"/servers/{server_id}/resources", use_client=True)
         attrs = resp.get("attributes", resp)
         return {
@@ -164,11 +193,13 @@ class PterodactylAPI:
 
     def send_command(self, server_id, command) -> dict:
         """Send a console command to the server (Client API)."""
+        self._require_client_api("send console command")
         return self._post(f"/servers/{server_id}/command",
                           {"command": command}, use_client=True)
 
     def set_power_state(self, server_id, signal) -> dict:
         """Change server power state (Client API). Signal: start, stop, restart, kill."""
+        self._require_client_api("change power state")
         if signal not in ("start", "stop", "restart", "kill"):
             raise ValueError(f"Invalid power signal: {signal}")
         return self._post(f"/servers/{server_id}/power",
@@ -180,6 +211,7 @@ class PterodactylAPI:
 
     def list_files(self, server_id, directory="/") -> list:
         """List files in a server directory (Client API)."""
+        self._require_client_api("list files")
         from urllib.parse import quote
         encoded_dir = quote(directory, safe="/")
         resp = self._get(f"/servers/{server_id}/files/list?directory={encoded_dir}",
