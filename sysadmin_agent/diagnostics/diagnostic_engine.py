@@ -30,7 +30,8 @@ class DiagnosticEngine:
 
     def run_all(self):
         results = []
-        with ThreadPoolExecutor(max_workers=8) as executor:
+        # Use fewer workers than max SSH channels to leave headroom
+        with ThreadPoolExecutor(max_workers=4) as executor:
             futures = {executor.submit(check): check.__name__ for check in self._checks}
             for future in as_completed(futures):
                 name = futures[future]
@@ -43,7 +44,7 @@ class DiagnosticEngine:
                         "name": name,
                         "status": "error",
                         "severity": "low",
-                        "details": str(e),
+                        "details": f"Check failed: {type(e).__name__}: {e}",
                         "fix": None,
                     })
         return results
