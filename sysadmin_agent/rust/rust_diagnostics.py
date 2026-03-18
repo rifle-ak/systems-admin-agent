@@ -670,10 +670,14 @@ class RustServerDiagnostics:
     def _read_oxide_log(self, filename):
         """Read an Oxide log file, trying all known directory casings.
 
-        Uses the cached log directory if already discovered.
+        Triggers dynamic directory discovery if the log dir isn't cached yet.
         """
         if not self.ptero or not self.server_id:
             return None
+
+        # Ensure the log directory is discovered first
+        if not self._oxide_log_dir:
+            self._discover_oxide_log_dir()
 
         # Try cached path first
         if self._oxide_log_dir:
@@ -687,8 +691,10 @@ class RustServerDiagnostics:
             except Exception:
                 pass
 
-        # Fall through to trying all paths
+        # Fall through to trying all hardcoded paths
         for log_dir in self._OXIDE_LOG_DIRS:
+            if log_dir == self._oxide_log_dir:
+                continue  # Already tried
             try:
                 content = self.ptero.get_file_contents(
                     self.server_id,
@@ -1632,15 +1638,17 @@ class RustServerDiagnostics:
         crash_indicators = []
         sources_checked = []
 
-        # Use specific phrases to avoid false positives from game events
-        # like "player was killed" or "entity terminated"
+        # Use specific phrases to avoid false positives from game events.
+        # "oom" matches "mushroom", "crash" matches "crashsite" monument,
+        # so we use multi-word phrases or regex patterns instead.
         crash_keywords = (
-            "crash", "segfault", "sigsegv", "sigkill", "sigabrt",
+            "crashed", "crashing",  # past/present tense avoids "crashsite"
+            "segfault", "sigsegv", "sigkill", "sigabrt",
             "out of memory", "system.outofmemoryexception",
             "unhandled exception", "stack overflow",
             "access violation", "fatal error",
-            "application crashed", "server crashed",
-            "oom kill", "oom-kill",
+            "application crash", "server crash",
+            "oom kill", "oom-kill", "oom_kill",
         )
 
         # 1. Check for crash files in /server/rust
@@ -1877,7 +1885,7 @@ class RustServerDiagnostics:
         )
         # For non-Oxide logs (Steam, console): broader matching is ok
         broad_error_keywords = (
-            "error", "exception", "failed", "crash", "fatal",
+            "error", "exception", "failed", "crashed", "fatal",
             "timeout", "timed out",
         )
         warning_keywords = (
