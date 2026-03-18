@@ -961,6 +961,7 @@ function loadProfile() {
     // Show Rust admin panel if profile has Rust data
     if ((profile.rcon_host || profile.ptero_url) && $('#rustAdmin')) {
         $('#rustAdmin').style.display = 'block';
+        if ($('#rustSaveSection')) $('#rustSaveSection').style.display = 'block';
     }
 
     showFlash('Profile loaded', 'success');
@@ -981,19 +982,27 @@ async function saveProfile() {
         key_path: authType === 'key' ? ($('#keyPath')?.value || '') : '',
     };
 
-    // Include Rust admin credentials if filled in
-    const rconHost = $('#rconHost')?.value || '';
-    const rconPort = $('#rconPort')?.value || '';
+    // Include Rust admin credentials — use form inputs if visible, tracked state if hidden
+    const rconHost = $('#rconHost')?.value || _rconState.host || '';
+    const rconPort = $('#rconPort')?.value || _rconState.port || '';
     const rconPassword = $('#rconPassword')?.value || '';
-    const pteroUrl = $('#pteroUrl')?.value || '';
+    const pteroUrl = $('#pteroUrl')?.value || _pteroState.url || '';
     const pteroApiKey = $('#pteroApiKey')?.value || '';
-    const pteroServerId = $('#pteroServerId')?.value || '';
+    const pteroServerId = $('#pteroServerId')?.value || _pteroState.serverId || '';
 
     if (rconHost) payload.rcon_host = rconHost;
     if (rconPort) payload.rcon_port = parseInt(rconPort);
     if (rconPassword) payload.rcon_password = rconPassword;
+    // If RCON password was already saved in profile and user didn't enter a new one, preserve it
+    if (!rconPassword && (_rconState.passwordSaved || $('#rconPassword')?.dataset.savedPassword === 'true')) {
+        payload.preserve_rcon_password = true;
+    }
     if (pteroUrl) payload.ptero_url = pteroUrl;
     if (pteroApiKey) payload.ptero_api_key = pteroApiKey;
+    // If API key was already saved and user didn't enter a new one, preserve it
+    if (!pteroApiKey && (_pteroState.apiKeySaved || $('#pteroApiKey')?.dataset.savedPassword === 'true')) {
+        payload.preserve_ptero_api_key = true;
+    }
     if (pteroServerId) payload.ptero_server_id = pteroServerId;
 
     // If password auth and a password is entered, ask about saving it
@@ -1467,6 +1476,10 @@ async function saveBillingCycle() {
 let rconConnected = false;
 let pteroConnected = false;
 
+// Track connection values so they survive form hiding
+let _rconState = { host: '', port: 28016, passwordEntered: false, passwordSaved: false };
+let _pteroState = { url: '', serverId: '', apiKeyEntered: false, apiKeySaved: false };
+
 function toggleRustPanel() {
     const panel = $('#rustPanel');
     const arrow = $('#rustToggle');
@@ -1474,6 +1487,13 @@ function toggleRustPanel() {
     const show = panel.style.display === 'none';
     panel.style.display = show ? 'block' : 'none';
     if (arrow) arrow.textContent = show ? '▾' : '▸';
+    // Show save button whenever the panel has any connection data
+    if (show && $('#rustSaveSection')) {
+        const hasData = ($('#rconHost')?.value || _rconState.host ||
+                         $('#pteroUrl')?.value || _pteroState.url ||
+                         rconConnected || pteroConnected);
+        if (hasData) $('#rustSaveSection').style.display = 'block';
+    }
 }
 
 function connectRcon() {
@@ -1485,6 +1505,12 @@ function connectRcon() {
         showFlash('RCON host and password are required', 'error');
         return;
     }
+    // Track values before the form hides
+    _rconState.host = host;
+    _rconState.port = parseInt(port);
+    _rconState.passwordEntered = !!password;
+    _rconState.passwordSaved = useSaved;
+
     updateProgress('Connecting to RCON...');
     const payload = { host, port: parseInt(port) };
     if (password) {
@@ -1511,6 +1537,12 @@ function connectPtero() {
         showFlash('Panel URL and API key are required', 'error');
         return;
     }
+    // Track values before the form hides
+    _pteroState.url = baseUrl;
+    _pteroState.serverId = serverId;
+    _pteroState.apiKeyEntered = !!apiKey;
+    _pteroState.apiKeySaved = useSaved;
+
     updateProgress('Connecting to Pterodactyl Panel...');
     const payload = { base_url: baseUrl, server_id: serverId };
     if (apiKey) {
@@ -1533,6 +1565,7 @@ function onRconConnected(data) {
     if ($('#rconForm')) $('#rconForm').style.display = 'none';
     if ($('#rconConnected')) $('#rconConnected').style.display = 'flex';
     if ($('#rustActions')) $('#rustActions').style.display = 'block';
+    if ($('#rustSaveSection')) $('#rustSaveSection').style.display = 'block';
 
     let msg = 'RCON connected.';
     if (data.server_info) {
@@ -1556,6 +1589,7 @@ function onPteroConnected(data) {
     pteroConnected = true;
     if ($('#pteroForm')) $('#pteroForm').style.display = 'none';
     if ($('#pteroConnected')) $('#pteroConnected').style.display = 'flex';
+    if ($('#rustSaveSection')) $('#rustSaveSection').style.display = 'block';
 
     let msg = 'Pterodactyl Panel connected.';
     if (data.servers && data.servers.length > 0) {

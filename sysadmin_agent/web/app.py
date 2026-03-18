@@ -569,17 +569,29 @@ def save_profile():
 
     # Handle Rust admin credentials (RCON + Pterodactyl)
     import base64 as _b64
+
+    # Get existing profile for preserving saved secrets
+    existing_profile = server_profiles.get(name, {})
+
     if data.get("rcon_password"):
         profile_data["rcon_password_obf"] = _b64.b64encode(
             data["rcon_password"].encode("utf-8")
         ).decode("ascii")
         profile_data.pop("rcon_password", None)
+    elif data.get("preserve_rcon_password") and existing_profile.get("rcon_password_obf"):
+        # Keep the existing saved RCON password
+        profile_data["rcon_password_obf"] = existing_profile["rcon_password_obf"]
+    profile_data.pop("preserve_rcon_password", None)
 
     if data.get("ptero_api_key"):
         profile_data["ptero_api_key_obf"] = _b64.b64encode(
             data["ptero_api_key"].encode("utf-8")
         ).decode("ascii")
         profile_data.pop("ptero_api_key", None)
+    elif data.get("preserve_ptero_api_key") and existing_profile.get("ptero_api_key_obf"):
+        # Keep the existing saved Pterodactyl API key
+        profile_data["ptero_api_key_obf"] = existing_profile["ptero_api_key_obf"]
+    profile_data.pop("preserve_ptero_api_key", None)
 
     server_profiles[name] = profile_data
     _save_config(server_profiles)
