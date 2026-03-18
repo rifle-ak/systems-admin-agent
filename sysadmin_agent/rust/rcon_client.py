@@ -48,7 +48,7 @@ class RCONClient:
             print(rcon.command("status"))
     """
 
-    def __init__(self, host, port=28016, password="", timeout=10):
+    def __init__(self, host, port=28016, password="", timeout=30):
         self.host = host
         self.port = port
         self.password = password

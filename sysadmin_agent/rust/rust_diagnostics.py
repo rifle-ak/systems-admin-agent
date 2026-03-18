@@ -105,62 +105,90 @@ class RustServerDiagnostics:
         return results
 
     def run_lag_diagnosis(self) -> dict:
-        """Focused diagnosis specifically for lag / rubber-banding reports.
+        """Deep lag / rubber-banding diagnosis.
 
-        Returns a structured analysis with likely causes ranked by probability.
+        Runs 10 checks, cross-correlates findings, and returns a structured
+        analysis with root cause identification and actionable fixes.
         """
         findings = []
+        raw = {}  # collected raw data for cross-correlation
 
-        # 1. Check tick rate — #1 cause of rubber-banding
-        self._progress("[1/5] Checking server tick rate (FPS)...")
+        total_steps = 10
+
+        # 1. Tick rate — the single most direct indicator
+        self._progress(f"[1/{total_steps}] Checking server tick rate (FPS)...")
         fps_result = self._safe_rcon("fps")
-        if fps_result:
-            fps_val = self._parse_fps(fps_result)
-            if fps_val is not None:
-                if fps_val < 10:
-                    findings.append({
-                        "cause": "Critically low server tick rate",
-                        "severity": "critical",
-                        "details": f"Server running at {fps_val} FPS (should be ~30). "
-                                   "This directly causes rubber-banding.",
-                        "likely_reason": "Entity overload, plugin lag, or insufficient CPU",
-                        "fix": "Check entity count, review plugin performance, consider map wipe",
-                    })
-                elif fps_val < 20:
-                    findings.append({
-                        "cause": "Low server tick rate",
-                        "severity": "high",
-                        "details": f"Server at {fps_val} FPS (target is 30). "
-                                   "Players will experience intermittent rubber-banding.",
-                        "likely_reason": "Growing entity count or heavy plugin load",
-                        "fix": "Run entity.count, check for entity-heavy bases, review plugins",
-                    })
+        fps_val = self._parse_fps(fps_result) if fps_result else None
+        raw["fps"] = fps_val
+        if fps_val is not None:
+            if fps_val < 10:
+                findings.append({
+                    "cause": "Critically low server tick rate",
+                    "severity": "critical",
+                    "details": f"Server running at {fps_val:.1f} FPS (target: 30). "
+                               "At this rate, every player experiences constant rubber-banding. "
+                               "The server physically cannot process movement fast enough.",
+                    "likely_reason": "Entity overload, plugin lag, or insufficient CPU — see other findings below",
+                    "fix": "This is a symptom, not the root cause. Check the findings below to see what's dragging FPS down.",
+                })
+            elif fps_val < 20:
+                findings.append({
+                    "cause": "Low server tick rate",
+                    "severity": "high",
+                    "details": f"Server at {fps_val:.1f} FPS (target: 30). "
+                               "Players will experience intermittent rubber-banding, especially during combat or vehicles.",
+                    "likely_reason": "Growing entity count, heavy plugin load, or CPU contention",
+                    "fix": "Check entity count and plugin performance findings below for the root cause.",
+                })
+            elif fps_val < 28:
+                findings.append({
+                    "cause": "Server tick rate slightly below target",
+                    "severity": "medium",
+                    "details": f"Server at {fps_val:.1f} FPS (target: 30). "
+                               "May cause subtle movement jitter, especially noticeable on horses or boats.",
+                    "likely_reason": "Normal for a busy server, but worth monitoring",
+                    "fix": "Not urgent, but addressing entity count or plugin load may help.",
+                })
 
-        # 2. Check entity count — #2 cause
-        self._progress("[2/5] Checking entity count...")
+        # 2. Entity count — #1 root cause of low FPS
+        self._progress(f"[2/{total_steps}] Checking entity count...")
         entity_result = self._safe_rcon("entity.count")
-        if entity_result:
-            count = self._parse_entity_count(entity_result)
-            if count is not None:
-                if count > 300000:
-                    findings.append({
-                        "cause": "Extreme entity count",
-                        "severity": "critical",
-                        "details": f"{count:,} entities on the map. This is a major performance drain.",
-                        "likely_reason": "Overdue wipe, entity-heavy builds, or loot accumulation",
-                        "fix": "Consider map wipe, or use entitiy cleanup plugins",
-                    })
-                elif count > 200000:
-                    findings.append({
-                        "cause": "High entity count",
-                        "severity": "high",
-                        "details": f"{count:,} entities. Performance degradation expected.",
-                        "likely_reason": "Long wipe cycle or large player base",
-                        "fix": "Schedule wipe soon, or run entity cleanup commands",
-                    })
+        entity_count = self._parse_entity_count(entity_result) if entity_result else None
+        raw["entities"] = entity_count
+        if entity_count is not None:
+            if entity_count > 300000:
+                findings.append({
+                    "cause": "Extreme entity count",
+                    "severity": "critical",
+                    "details": f"{entity_count:,} entities on the map (healthy: <150k, danger: >300k). "
+                               "This is almost certainly the primary cause of lag. Every server tick must "
+                               "process all entities — at this count, each tick takes far too long.",
+                    "likely_reason": "Overdue wipe, decay disabled or too low, massive bases, or loot accumulation",
+                    "fix": "Map wipe is the most effective fix. If not possible: check decay.scale in server.cfg, "
+                           "use an entity cleanup plugin, or manually remove abandoned bases.",
+                })
+            elif entity_count > 200000:
+                findings.append({
+                    "cause": "High entity count",
+                    "severity": "high",
+                    "details": f"{entity_count:,} entities (healthy: <150k). Performance is degrading. "
+                               "You'll see FPS dropping and save times increasing.",
+                    "likely_reason": "Long wipe cycle, large player base, or decay disabled",
+                    "fix": "Schedule a wipe soon. In the meantime, check if decay.scale is > 0 in server.cfg, "
+                           "and consider an entity cleanup plugin like RustCleaner.",
+                })
+            elif entity_count > 150000:
+                findings.append({
+                    "cause": "Entity count getting high",
+                    "severity": "medium",
+                    "details": f"{entity_count:,} entities. Not critical yet, but approaching the danger zone.",
+                    "likely_reason": "Normal for mid-wipe on a busy server",
+                    "fix": "Monitor this — if it keeps climbing above 200k, plan a wipe.",
+                })
 
-        # 3. Check server resources via Pterodactyl
-        self._progress("[3/5] Checking server resources...")
+        # 3. Server resources (CPU, memory, disk, uptime)
+        self._progress(f"[3/{total_steps}] Checking server resources (CPU/RAM/disk)...")
+        cpu = mem_pct = mem_mb = mem_limit_mb = uptime_hrs = 0
         if self.ptero and self.server_id:
             try:
                 resources = self.ptero.get_resources(self.server_id)
@@ -168,72 +196,284 @@ class RustServerDiagnostics:
                 cpu = res.get("cpu_absolute", 0)
                 mem_bytes = res.get("memory_bytes", 0)
                 mem_limit = res.get("memory_limit_bytes", 0)
+                uptime_ms = res.get("uptime", 0)
+                uptime_hrs = uptime_ms / (1000 * 3600) if uptime_ms else 0
+                mem_mb = mem_bytes // (1024 * 1024)
+                mem_limit_mb = mem_limit // (1024 * 1024) if mem_limit else 0
+                mem_pct = (mem_bytes / mem_limit * 100) if mem_limit else 0
 
-                if cpu > 90:
+                raw["cpu"] = cpu
+                raw["mem_pct"] = mem_pct
+                raw["uptime_hrs"] = uptime_hrs
+
+                if cpu > 95:
                     findings.append({
-                        "cause": "CPU saturation",
+                        "cause": "CPU maxed out",
                         "severity": "critical",
-                        "details": f"CPU at {cpu:.1f}%. Server cannot maintain tick rate.",
-                        "likely_reason": "Too many entities/players for allocated CPU",
-                        "fix": "Reduce entity count, lower max players, or upgrade CPU allocation",
+                        "details": f"CPU at {cpu:.1f}%. The server is completely saturated — "
+                                   "it cannot process ticks fast enough, which directly causes rubber-banding.",
+                        "likely_reason": "Too many entities for the allocated CPU, or a plugin is consuming excessive CPU",
+                        "fix": "Reduce entity count (wipe), check for CPU-hungry plugins with `perf` command, "
+                               "or upgrade server CPU allocation in Pterodactyl.",
+                    })
+                elif cpu > 80:
+                    findings.append({
+                        "cause": "High CPU usage",
+                        "severity": "high",
+                        "details": f"CPU at {cpu:.1f}%. Approaching saturation. "
+                                   f"Tick rate will start dropping as load increases.",
+                        "likely_reason": "High entity count and/or heavy plugin load",
+                        "fix": "Monitor closely. If CPU hits 95%+, lag will become constant.",
                     })
 
-                if mem_limit > 0 and mem_bytes > 0:
-                    mem_pct = (mem_bytes / mem_limit) * 100
-                    if mem_pct > 90:
-                        findings.append({
-                            "cause": "Memory exhaustion",
-                            "severity": "critical",
-                            "details": f"Memory at {mem_pct:.1f}% — "
-                                       f"{mem_bytes // (1024*1024)}MB / {mem_limit // (1024*1024)}MB. "
-                                       "Server may be swapping or about to OOM.",
-                            "likely_reason": "Large map, many plugins, or memory leak",
-                            "fix": "Restart server, check for leaky plugins, increase memory limit",
-                        })
-            except Exception as e:
-                logger.warning("Resource check failed: %s", e)
+                if mem_pct > 90:
+                    findings.append({
+                        "cause": "Memory nearly full",
+                        "severity": "critical",
+                        "details": f"Memory at {mem_pct:.1f}% ({mem_mb}MB / {mem_limit_mb}MB). "
+                                   "When memory runs out, the server will either crash (OOM kill) or "
+                                   "start swapping to disk, which causes massive lag spikes.",
+                        "likely_reason": "Large map + many plugins + long uptime = memory leak accumulation",
+                        "fix": "Restart the server to free leaked memory. If it fills up again quickly, "
+                               "identify and remove memory-leaking plugins or increase the memory limit.",
+                    })
+                elif mem_pct > 80:
+                    findings.append({
+                        "cause": "High memory usage",
+                        "severity": "high",
+                        "details": f"Memory at {mem_pct:.1f}% ({mem_mb}MB / {mem_limit_mb}MB). "
+                                   "Risk of OOM if it keeps growing.",
+                        "likely_reason": "Memory growth over time — possible leak in a plugin",
+                        "fix": "Plan a restart soon. Check if memory keeps growing after restart to identify leaks.",
+                    })
 
-        # 4. Check for plugin lag
-        self._progress("[4/5] Checking plugin performance...")
+                if uptime_hrs > 72 and mem_pct > 70:
+                    findings.append({
+                        "cause": "Server running without restart for a long time",
+                        "severity": "medium",
+                        "details": f"Server has been up for {uptime_hrs:.0f} hours ({uptime_hrs/24:.1f} days) "
+                                   f"and memory is at {mem_pct:.1f}%. Rust servers accumulate memory leaks "
+                                   "over time — periodic restarts help.",
+                        "likely_reason": "Normal memory growth + plugin leaks over extended uptime",
+                        "fix": "Schedule daily or twice-daily restarts during low-population hours.",
+                    })
+            except Exception as e:
+                findings.append({
+                    "cause": "Could not check server resources",
+                    "severity": "medium",
+                    "details": f"Pterodactyl resource check failed: {e}. "
+                               "Without resource data, we can't tell if CPU or memory is the problem.",
+                    "likely_reason": "API key permissions or connection issue",
+                    "fix": "Check Pterodactyl connection and API key permissions.",
+                })
+
+        # 4. Plugin performance (perf hooks)
+        self._progress(f"[4/{total_steps}] Profiling plugin hook performance...")
         perf_result = self._safe_rcon("perf")
+        raw["perf"] = perf_result
         if perf_result:
             slow_hooks = self._parse_perf_hooks(perf_result)
             if slow_hooks:
-                findings.append({
-                    "cause": "Slow plugin hooks",
-                    "severity": "high",
-                    "details": f"Found {len(slow_hooks)} slow plugin hooks:\n" +
-                               "\n".join(f"  {h['name']}: {h['time']}ms avg" for h in slow_hooks[:5]),
-                    "likely_reason": "Plugin code running too slowly per tick",
-                    "fix": "Reload or replace the slow plugins",
-                })
+                # Calculate total time stolen from each tick
+                total_ms = sum(h["time"] for h in slow_hooks)
+                hook_list = "\n".join(f"  • {h['name']}: {h['time']:.1f}ms/call" for h in slow_hooks[:8])
+                if total_ms > 20:
+                    findings.append({
+                        "cause": "Plugins consuming too much tick time",
+                        "severity": "critical" if total_ms > 50 else "high",
+                        "details": f"Slow plugin hooks are consuming ~{total_ms:.0f}ms per tick "
+                                   f"(a 30fps tick budget is 33ms — these plugins alone use "
+                                   f"{total_ms/33*100:.0f}% of it):\n{hook_list}",
+                        "likely_reason": "Poorly optimized plugins running expensive operations every tick",
+                        "fix": f"The worst offender is '{slow_hooks[0]['name']}' at {slow_hooks[0]['time']:.1f}ms. "
+                               "Try disabling or replacing it and check if FPS improves. "
+                               "Use `oxide.unload PluginName` to test.",
+                    })
+                elif slow_hooks:
+                    hook_list_short = ", ".join(f"{h['name']} ({h['time']:.1f}ms)" for h in slow_hooks[:3])
+                    findings.append({
+                        "cause": "Some slow plugin hooks detected",
+                        "severity": "medium",
+                        "details": f"Found {len(slow_hooks)} slow hooks totaling ~{total_ms:.0f}ms: {hook_list_short}",
+                        "likely_reason": "Plugins with room for optimization",
+                        "fix": "Not critical unless FPS is low, but worth keeping an eye on.",
+                    })
 
-        # 5. Network check
-        self._progress("[5/5] Checking network and player pings...")
+        # 5. Network and player pings
+        self._progress(f"[5/{total_steps}] Checking player connections and ping...")
         status_result = self._safe_rcon("status")
+        raw["status"] = status_result
+        total_players = 0
         if status_result:
             high_ping = self._parse_high_ping_players(status_result)
-            if high_ping:
-                total_players = self._count_players(status_result)
-                pct = (len(high_ping) / max(total_players, 1)) * 100
+            total_players = self._count_players(status_result)
+            raw["players"] = total_players
+            if high_ping and total_players:
+                pct = (len(high_ping) / total_players) * 100
+                player_list = ", ".join(f"{p['name']} ({p['ping']}ms)" for p in high_ping[:5])
                 if pct > 50:
                     findings.append({
-                        "cause": "Widespread high ping",
+                        "cause": "Widespread high ping — possible network issue",
                         "severity": "high",
-                        "details": f"{len(high_ping)}/{total_players} players have ping >150ms. "
-                                   "Could indicate server-side network issue.",
-                        "likely_reason": "Server network saturation or hosting provider issue",
-                        "fix": "Check server bandwidth usage, contact host if persistent",
+                        "details": f"{len(high_ping)}/{total_players} players ({pct:.0f}%) have ping >150ms: "
+                                   f"{player_list}. When >50% of players have high ping, it usually "
+                                   "indicates a server-side network problem, not individual client issues.",
+                        "likely_reason": "Server network saturation, hosting provider routing issue, or DDoS",
+                        "fix": "Check with your hosting provider. Look at network TX/RX in Pterodactyl. "
+                               "If under DDoS, enable DDoS protection or contact host.",
                     })
-                else:
+                elif len(high_ping) > 3:
                     findings.append({
-                        "cause": "Some players with high ping",
+                        "cause": "Several players with high ping",
                         "severity": "medium",
-                        "details": f"{len(high_ping)}/{total_players} players have ping >150ms. "
-                                   "Likely client-side for affected players.",
-                        "likely_reason": "Distant players or their ISP issues",
-                        "fix": "This is typically client-side — not a server issue",
+                        "details": f"{len(high_ping)}/{total_players} players with ping >150ms: {player_list}",
+                        "likely_reason": "Players connecting from far away or on poor connections",
+                        "fix": "Likely client-side. These players may experience rubber-banding "
+                               "that other players don't see.",
                     })
+
+        # 6. Save performance — do saves cause stutters?
+        self._progress(f"[6/{total_steps}] Testing world save performance...")
+        try:
+            start = time.monotonic()
+            save_result = self.rcon.command("server.save", timeout=120) if self.rcon else None
+            save_time = time.monotonic() - start if save_result is not None else None
+            raw["save_time"] = save_time
+            if save_time is not None:
+                if save_time > 10:
+                    findings.append({
+                        "cause": "World saves causing lag spikes",
+                        "severity": "high",
+                        "details": f"World save took {save_time:.1f}s. During this time, ALL players "
+                                   f"experience a freeze/stutter. With default save interval, this happens "
+                                   f"every 10 minutes.",
+                        "likely_reason": "Too many entities to serialize quickly — same root cause as low FPS",
+                        "fix": "Reduce entity count (wipe/cleanup). You can increase server.saveinterval "
+                               "to reduce frequency, but saves will get even longer as entities grow.",
+                    })
+                elif save_time > 5:
+                    findings.append({
+                        "cause": "Save times getting long",
+                        "severity": "medium",
+                        "details": f"World save took {save_time:.1f}s. Players may notice brief stutters "
+                                   "every save interval.",
+                        "likely_reason": "Growing entity count",
+                        "fix": "Monitor this. If it gets above 10s, it will cause noticeable lag spikes.",
+                    })
+        except Exception:
+            pass
+
+        # 7. Check Oxide health and erroring plugins
+        self._progress(f"[7/{total_steps}] Checking plugin health (errors/crashes)...")
+        oxide_result = self._safe_rcon("oxide.plugins")
+        if oxide_result:
+            errored_plugins = []
+            for line in oxide_result.splitlines():
+                stripped = line.strip()
+                if any(kw in stripped.lower() for kw in ("error", "failed", "crash", "unloaded")):
+                    errored_plugins.append(stripped[:120])
+            if errored_plugins:
+                findings.append({
+                    "cause": f"{len(errored_plugins)} plugin(s) in error state",
+                    "severity": "high" if len(errored_plugins) > 3 else "medium",
+                    "details": "Errored/crashed plugins can cause lag through repeated error logging, "
+                               "failed hook calls, or resource leaks:\n" +
+                               "\n".join(f"  • {p}" for p in errored_plugins[:10]),
+                    "likely_reason": "Plugin incompatibility, outdated plugin, or missing dependency",
+                    "fix": "Reload errored plugins with `oxide.reload PluginName`. If they keep crashing, "
+                           "remove them or check for updates.",
+                })
+
+        # 8. Check for GC pressure
+        self._progress(f"[8/{total_steps}] Checking garbage collection pressure...")
+        gc_result = self._safe_rcon("gc.collect")
+        if gc_result:
+            # Parse memory freed from GC
+            gc_numbers = re.findall(r'(\d+(?:\.\d+)?)\s*(?:MB|mb)', gc_result)
+            if gc_numbers:
+                freed = max(float(n) for n in gc_numbers)
+                if freed > 500:
+                    findings.append({
+                        "cause": "Significant garbage collection pressure",
+                        "severity": "medium",
+                        "details": f"GC freed ~{freed:.0f}MB. Large GC collections can cause "
+                                   "brief frame hitches. This often indicates plugins creating "
+                                   "a lot of temporary objects.",
+                        "likely_reason": "Plugin memory allocation patterns or large map",
+                        "fix": "Schedule periodic `gc.collect` via a timer plugin to prevent buildup.",
+                    })
+
+        # 9. Check server config for lag-inducing settings
+        self._progress(f"[9/{total_steps}] Checking server configuration...")
+        if self.ptero and self.server_id:
+            try:
+                cfg = self.ptero.rust_get_server_cfg(self.server_id)
+                if cfg:
+                    settings = {}
+                    for line in cfg.splitlines():
+                        line = line.strip()
+                        if not line or line.startswith("//") or line.startswith("#"):
+                            continue
+                        parts = line.split(None, 1)
+                        if len(parts) == 2:
+                            settings[parts[0].lower()] = parts[1].strip('"').strip("'")
+
+                    config_issues = []
+                    decay = settings.get("decay.scale", "1")
+                    if decay == "0":
+                        config_issues.append(
+                            "decay.scale is 0 — entities NEVER decay. This is the #1 config cause of "
+                            "entity buildup and lag. Even setting it to 0.5 would help enormously."
+                        )
+                    elif decay and float(decay) < 0.5:
+                        config_issues.append(
+                            f"decay.scale is {decay} — very low decay means entities accumulate faster "
+                            "than they disappear, leading to eventual lag."
+                        )
+
+                    tick_rate = settings.get("server.tickrate")
+                    if tick_rate and int(tick_rate) < 30:
+                        config_issues.append(
+                            f"server.tickrate is {tick_rate} — below 30 will feel laggy to players. "
+                            "Set to 30 unless you have a specific reason not to."
+                        )
+
+                    si = settings.get("server.saveinterval")
+                    if si:
+                        try:
+                            si_val = int(si)
+                            if si_val < 300:
+                                config_issues.append(
+                                    f"server.saveinterval is {si_val}s — very frequent saves "
+                                    "cause repeated lag spikes. Recommend 600 (default)."
+                                )
+                        except ValueError:
+                            pass
+
+                    stability = settings.get("server.stability", "true")
+                    if stability.lower() == "false":
+                        config_issues.append(
+                            "server.stability is false — allows floating bases that create many extra entities."
+                        )
+
+                    if config_issues:
+                        findings.append({
+                            "cause": "Server configuration contributing to lag",
+                            "severity": "high" if "decay.scale is 0" in str(config_issues) else "medium",
+                            "details": "Found config settings that contribute to lag:\n" +
+                                       "\n".join(f"  • {i}" for i in config_issues),
+                            "likely_reason": "Server configured with settings that allow entity/performance problems",
+                            "fix": "Edit server.cfg via Pterodactyl file manager. Key fixes: "
+                                   "set decay.scale to 1, server.tickrate to 30, server.saveinterval to 600.",
+                        })
+            except Exception:
+                pass
+
+        # 10. Cross-correlate and build root cause analysis
+        self._progress(f"[10/{total_steps}] Analyzing root cause...")
+        root_cause = self._identify_root_cause(raw, findings)
+        if root_cause:
+            findings.insert(0, root_cause)
 
         # Sort by severity
         severity_order = {"critical": 0, "high": 1, "medium": 2, "low": 3}
@@ -243,8 +483,78 @@ class RustServerDiagnostics:
             "lag_report": True,
             "findings": findings,
             "summary": self._build_lag_summary(findings),
+            "raw_data": {
+                "fps": raw.get("fps"),
+                "entities": raw.get("entities"),
+                "cpu": raw.get("cpu"),
+                "mem_pct": raw.get("mem_pct"),
+                "players": raw.get("players"),
+                "uptime_hrs": raw.get("uptime_hrs"),
+                "save_time": raw.get("save_time"),
+            },
             "timestamp": time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime()),
         }
+
+    def _identify_root_cause(self, raw, findings):
+        """Cross-correlate collected data to identify the most likely root cause."""
+        fps = raw.get("fps")
+        entities = raw.get("entities")
+        cpu = raw.get("cpu")
+        mem_pct = raw.get("mem_pct")
+
+        # No issues found at all
+        if not findings:
+            return None
+
+        # Only return a root cause analysis if we have enough data
+        if fps is None and entities is None and cpu is None:
+            return None
+
+        # Cross-correlation patterns
+        if entities and entities > 200000 and fps and fps < 20:
+            return {
+                "cause": "ROOT CAUSE: Entity overload is killing server performance",
+                "severity": "critical",
+                "details": f"The server has {entities:,} entities and is running at only {fps:.0f} FPS. "
+                           "This is the classic Rust performance death spiral: too many entities → "
+                           "each tick takes too long → FPS drops → rubber-banding.\n\n"
+                           "Every entity (building block, deployed item, dropped loot, NPC) must be "
+                           "processed every server tick. At this count, there is simply too much work "
+                           "for the CPU to handle within a 33ms tick budget.",
+                "likely_reason": "Overdue map wipe or decay disabled/too low",
+                "fix": "The only real fix is reducing entity count. Options:\n"
+                       "  1. Map wipe (most effective, instantly fixes lag)\n"
+                       "  2. Enable/increase decay (server.cfg: decay.scale 1.0)\n"
+                       "  3. Use cleanup plugins (RustCleaner, DecaySpeed)\n"
+                       "  4. Manually remove massive abandoned bases",
+            }
+
+        if cpu and cpu > 90 and fps and fps < 20 and (not entities or entities < 200000):
+            return {
+                "cause": "ROOT CAUSE: CPU is maxed out (not entity-related)",
+                "severity": "critical",
+                "details": f"CPU is at {cpu:.1f}% but entity count is {'only ' + f'{entities:,}' if entities else 'unknown'}. "
+                           "This means something other than entities is consuming CPU — "
+                           "likely one or more plugins running expensive operations.",
+                "likely_reason": "Plugin performance issue or too many players for server allocation",
+                "fix": "Check the plugin performance findings above. Disable plugins one at a time "
+                       "to identify the CPU hog. Or upgrade server CPU allocation.",
+            }
+
+        if mem_pct and mem_pct > 90:
+            return {
+                "cause": "ROOT CAUSE: Server is running out of memory",
+                "severity": "critical",
+                "details": f"Memory is at {mem_pct:.1f}%. When a Rust server hits its memory limit, "
+                           "it either gets OOM-killed by the system or starts swapping to disk. "
+                           "Disk-based swap is orders of magnitude slower than RAM, causing "
+                           "massive lag spikes that look like freezing.",
+                "likely_reason": "Memory leak in plugin(s), too many plugins loaded, or insufficient memory allocation",
+                "fix": "Restart the server immediately to free leaked memory. Then monitor if it "
+                       "fills up again quickly — if so, a plugin is leaking.",
+            }
+
+        return None
 
     # ------------------------------------------------------------------
     # Individual diagnostic checks
@@ -1026,12 +1336,17 @@ class RustServerDiagnostics:
     # Parsing helpers
     # ------------------------------------------------------------------
 
-    def _safe_rcon(self, cmd):
+    # Commands that may take a long time on loaded servers
+    _HEAVY_COMMANDS = {"entity.count", "server.save", "status", "serverinfo", "perf"}
+
+    def _safe_rcon(self, cmd, timeout=None):
         """Execute an RCON command, returning None if not available."""
         if not self.rcon:
             return None
         try:
-            return self.rcon.command(cmd)
+            if timeout is None:
+                timeout = 60 if cmd.split()[0] in self._HEAVY_COMMANDS else 30
+            return self.rcon.command(cmd, timeout=timeout)
         except Exception as e:
             logger.debug("RCON command '%s' failed: %s", cmd, e)
             return None
@@ -1120,14 +1435,32 @@ class RustServerDiagnostics:
     def _build_lag_summary(self, findings):
         """Build a human-readable lag diagnosis summary."""
         if not findings:
-            return "No obvious lag sources detected. Issue may be intermittent or client-side."
+            return ("No obvious lag sources detected from server-side checks. "
+                    "The issue may be intermittent, client-side, or network-related "
+                    "between the player and the server.")
         critical = [f for f in findings if f["severity"] == "critical"]
         high = [f for f in findings if f["severity"] == "high"]
+        medium = [f for f in findings if f["severity"] == "medium"]
+
+        parts = []
         if critical:
-            return f"CRITICAL: {critical[0]['cause']}. {critical[0]['details']}"
+            parts.append(f"{len(critical)} critical issue(s)")
         if high:
-            return f"Likely cause: {high[0]['cause']}. {high[0]['details']}"
-        return f"Minor issues found: {findings[0]['cause']}."
+            parts.append(f"{len(high)} high-severity issue(s)")
+        if medium:
+            parts.append(f"{len(medium)} medium issue(s)")
+
+        summary = f"Found {', '.join(parts)}. "
+
+        # Lead with the root cause if we identified one
+        root = next((f for f in findings if f["cause"].startswith("ROOT CAUSE")), None)
+        if root:
+            summary += root["cause"].replace("ROOT CAUSE: ", "") + "."
+        elif critical:
+            summary += f"Most urgent: {critical[0]['cause']}."
+        elif high:
+            summary += f"Likely cause: {high[0]['cause']}."
+        return summary
 
     def _ok(self, name, details, category):
         return {

@@ -1621,50 +1621,140 @@ function onRustDiagnosticsResult(data) {
         addMessage('agent', 'No diagnostic results.');
         return;
     }
-    const table = renderRustDiagnostics(results);
-    addMessage('agent', table);
+
+    // Separate issues from healthy checks
+    const issues = results.filter(r => r.status !== 'ok');
+    const healthy = results.filter(r => r.status === 'ok');
+
+    // Sort issues by severity
+    const sevOrder = { critical: 0, high: 1, medium: 2, low: 3 };
+    issues.sort((a, b) => (sevOrder[a.severity] || 99) - (sevOrder[b.severity] || 99));
+
+    const html = renderRustDiagnostics(issues, healthy);
+    addMessage('agent', html);
 }
 
 function onRustLagResult(data) {
     removeMessage('progress-msg');
-    const diagnosis = data.diagnosis || [];
-    if (diagnosis.length === 0) {
-        addMessage('agent', 'No lag issues detected.');
+    const report = data.diagnosis || {};
+    const findings = report.findings || [];
+    const summary = report.summary || '';
+    const timestamp = report.timestamp || '';
+
+    if (findings.length === 0) {
+        let html = '<div class="diag-report">';
+        html += '<div class="diag-header diag-header-ok"><strong>Lag Diagnosis</strong> — No obvious issues detected</div>';
+        if (summary) html += `<div class="diag-summary">${escapeHtml(summary)}</div>`;
+        if (timestamp) html += `<div class="diag-timestamp">${escapeHtml(timestamp)}</div>`;
+        html += '</div>';
+        addMessage('agent', html);
         return;
     }
-    let html = '<strong>Lag Diagnosis</strong> (ranked by probability)<br><br>';
-    html += '<table class="diag-table"><thead><tr><th>Check</th><th>Status</th><th>Severity</th><th>Details</th></tr></thead><tbody>';
-    for (const item of diagnosis) {
-        const sevClass = item.severity === 'critical' ? 'diag-critical' :
-                         item.severity === 'high' ? 'diag-high' :
-                         item.severity === 'warning' ? 'diag-warning' : 'diag-ok';
-        html += `<tr class="${sevClass}">`;
-        html += `<td>${escapeHtml(item.name || item.check || '')}</td>`;
-        html += `<td>${escapeHtml(item.status || '')}</td>`;
-        html += `<td>${escapeHtml(item.severity || '')}</td>`;
-        html += `<td>${escapeHtml(item.message || item.details || '')}</td>`;
-        html += `</tr>`;
+
+    let html = '<div class="diag-report">';
+    html += '<div class="diag-header diag-header-warn"><strong>Lag Diagnosis</strong> — Issues found (ranked by severity)</div>';
+    if (summary) html += `<div class="diag-summary">${escapeHtml(summary)}</div>`;
+
+    for (const f of findings) {
+        const sevClass = f.severity === 'critical' ? 'diag-card-critical' :
+                         f.severity === 'high' ? 'diag-card-high' :
+                         f.severity === 'medium' ? 'diag-card-medium' : 'diag-card-low';
+        html += `<div class="diag-card ${sevClass}">`;
+        html += `<div class="diag-card-title"><span class="diag-sev-badge diag-sev-${escapeHtml(f.severity)}">${escapeHtml(f.severity).toUpperCase()}</span> ${escapeHtml(f.cause || '')}</div>`;
+        html += `<div class="diag-card-details">${escapeHtml(f.details || '')}</div>`;
+        if (f.likely_reason) html += `<div class="diag-card-reason"><strong>Why:</strong> ${escapeHtml(f.likely_reason)}</div>`;
+        if (f.fix) html += `<div class="diag-card-fix"><strong>Fix:</strong> ${escapeHtml(f.fix)}</div>`;
+        html += '</div>';
     }
-    html += '</tbody></table>';
+
+    if (timestamp) html += `<div class="diag-timestamp">${escapeHtml(timestamp)}</div>`;
+    html += '</div>';
     addMessage('agent', html);
 }
 
-function renderRustDiagnostics(results) {
-    let html = '<strong>Rust Server Diagnostics</strong><br><br>';
-    html += '<table class="diag-table"><thead><tr><th>Check</th><th>Status</th><th>Severity</th><th>Details</th></tr></thead><tbody>';
-    for (const r of results) {
-        const sevClass = r.severity === 'critical' ? 'diag-critical' :
-                         r.severity === 'high' ? 'diag-high' :
-                         r.severity === 'warning' ? 'diag-warning' : 'diag-ok';
-        html += `<tr class="${sevClass}">`;
-        html += `<td>${escapeHtml(r.name || '')}</td>`;
-        html += `<td>${escapeHtml(r.status || '')}</td>`;
-        html += `<td>${escapeHtml(r.severity || '')}</td>`;
-        html += `<td>${escapeHtml(r.message || '')}</td>`;
-        html += `</tr>`;
+function renderRustDiagnostics(issues, healthy) {
+    let html = '<div class="diag-report">';
+
+    // Header with issue count
+    if (issues.length === 0) {
+        html += '<div class="diag-header diag-header-ok"><strong>Server Diagnostics</strong> — All checks passed</div>';
+    } else {
+        const critical = issues.filter(r => r.severity === 'high' && r.status === 'critical').length;
+        const warnings = issues.length - critical;
+        let label = '';
+        if (critical) label += `${critical} critical`;
+        if (critical && warnings) label += ', ';
+        if (warnings) label += `${warnings} warning(s)`;
+        html += `<div class="diag-header diag-header-warn"><strong>Server Diagnostics</strong> — ${label} found</div>`;
     }
-    html += '</tbody></table>';
+
+    // Issue cards with full details and fix buttons
+    for (const r of issues) {
+        const sevClass = r.status === 'critical' ? 'diag-card-critical' :
+                         r.severity === 'high' ? 'diag-card-high' :
+                         r.severity === 'medium' ? 'diag-card-medium' : 'diag-card-low';
+        const friendlyName = (r.name || '').replace('check_', '').replace(/_/g, ' ');
+        html += `<div class="diag-card ${sevClass}">`;
+        html += `<div class="diag-card-title"><span class="diag-sev-badge diag-sev-${escapeHtml(r.severity)}">${escapeHtml(r.status || r.severity).toUpperCase()}</span> ${escapeHtml(friendlyName)}</div>`;
+        html += `<div class="diag-card-details">${escapeHtml(r.details || '(no details)')}</div>`;
+
+        // Render fix suggestions as actionable buttons
+        if (r.fix && Array.isArray(r.fix) && r.fix.length > 0) {
+            html += '<div class="diag-card-fixes">';
+            html += '<strong>Suggested fixes:</strong>';
+            for (const fix of r.fix) {
+                const isDestructive = fix.destructive;
+                const btnClass = isDestructive ? 'btn-fix btn-fix-destructive' : 'btn-fix';
+                const icon = isDestructive ? '⚠ ' : '▶ ';
+                if (fix.command_rcon) {
+                    html += `<button class="${btnClass}" onclick="confirmAndRunFix('rcon', '${escapeHtml(fix.command_rcon)}', ${isDestructive})" title="${escapeHtml(fix.description || '')}">`;
+                    html += `${icon}${escapeHtml(fix.description || fix.command_rcon)} <code>${escapeHtml(fix.command_rcon)}</code></button>`;
+                } else if (fix.command_ptero) {
+                    html += `<button class="${btnClass}" onclick="confirmAndRunFix('ptero', '${escapeHtml(fix.command_ptero)}', ${isDestructive})" title="${escapeHtml(fix.description || '')}">`;
+                    html += `${icon}${escapeHtml(fix.description || fix.command_ptero)} <code>${escapeHtml(fix.command_ptero)}</code></button>`;
+                }
+            }
+            html += '</div>';
+        }
+        html += '</div>';
+    }
+
+    // Collapsible healthy checks summary
+    if (healthy.length > 0) {
+        html += '<details class="diag-healthy-section">';
+        html += `<summary class="diag-healthy-summary">${healthy.length} check(s) passed</summary>`;
+        html += '<div class="diag-healthy-list">';
+        for (const r of healthy) {
+            const friendlyName = (r.name || '').replace('check_', '').replace(/_/g, ' ');
+            html += `<div class="diag-healthy-item"><span class="diag-check-ok">✓</span> <strong>${escapeHtml(friendlyName)}</strong>`;
+            if (r.details) html += ` — ${escapeHtml(r.details)}`;
+            html += '</div>';
+        }
+        html += '</div></details>';
+    }
+
+    html += '</div>';
     return html;
+}
+
+function confirmAndRunFix(type, command, isDestructive) {
+    const label = isDestructive ? 'DESTRUCTIVE' : 'safe';
+    const msg = isDestructive
+        ? `⚠️ This is a DESTRUCTIVE action.\n\nCommand: ${command}\n\nAre you sure you want to run this?`
+        : `Run this fix?\n\nCommand: ${command}`;
+    if (!confirm(msg)) return;
+
+    if (type === 'rcon') {
+        updateProgress(`Running fix: ${command}...`);
+        socket.emit('rust_rcon_command', { command });
+    } else if (type === 'ptero') {
+        // Handle ptero commands like "power:restart"
+        const parts = command.split(':');
+        if (parts.length === 2 && parts[0] === 'power') {
+            updateProgress(`Running fix: ${parts[1]} server...`);
+            socket.emit('rust_ptero_action', { action: parts[1] });
+        }
+    }
 }
 
 function onRustPluginResult(data) {
