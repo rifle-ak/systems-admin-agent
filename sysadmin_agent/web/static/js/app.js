@@ -1351,6 +1351,12 @@ async function doUpgrade() {
             const newVer = data.new_version ? ` to v${data.new_version}` : '';
             showFlash(`Update complete${newVer}. Restarting...`, 'success');
 
+            // Re-enable button immediately so it's usable if restart fails
+            if (btn) {
+                btn.disabled = false;
+                btn.textContent = 'Update';
+            }
+
             // Auto-restart after a short delay
             if (data.restart_required) {
                 setTimeout(async () => {
@@ -1363,6 +1369,9 @@ async function doUpgrade() {
                     showFlash('Server restarting, page will reload in 5 seconds...', 'info');
                     setTimeout(() => { window.location.reload(); }, 5000);
                 }, 1000);
+            } else {
+                // No restart needed — re-check for updates
+                await checkForUpdates();
             }
         } else {
             showFlash('Update failed: ' + (data.message || 'Unknown error'), 'error');

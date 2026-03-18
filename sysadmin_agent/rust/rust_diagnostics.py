@@ -1123,13 +1123,31 @@ class RustServerDiagnostics:
                 line = line.strip()
                 if not line:
                     continue
-                plugin_count += 1
-                if "loaded" in line.lower():
-                    loaded += 1
-                # Strip quoted plugin name to avoid false positives like "Nav Mesh Error Fix"
-                line_without_name = re.sub(r'"[^"]*"', '""', line)
-                if "error" in line_without_name.lower() or "failed" in line_without_name.lower():
-                    errored += 1
+                ll = line.lower()
+                # Count plugin lines — they typically start with a number or
+                # contain a quoted plugin name like "PluginName"
+                is_plugin_line = bool(
+                    re.match(r'^\d+\s', line) or  # "01 ..."
+                    '"' in line  # Contains quoted plugin name
+                )
+                if is_plugin_line:
+                    plugin_count += 1
+                    # Check for loaded status — may say "loaded", or if it
+                    # doesn't say "error"/"failed"/"unloaded", assume loaded
+                    line_without_name = re.sub(r'"[^"]*"', '""', line)
+                    lln = line_without_name.lower()
+                    if "error" in lln or "failed" in lln:
+                        errored += 1
+                    elif "unloaded" in lln and "not loaded" not in lln:
+                        pass  # Explicitly unloaded
+                    else:
+                        loaded += 1  # No error indicators = loaded
+                elif "loaded" in ll:
+                    # Summary line like "Listing 173 plugins:"
+                    # or "173 plugin(s) loaded"
+                    match = re.search(r'(\d+)\s*plugin', ll)
+                    if match:
+                        loaded = max(loaded, int(match.group(1)))
 
         # Cross-reference with Pterodactyl file listing for accurate count
         disk_plugin_count = 0
@@ -1167,20 +1185,23 @@ class RustServerDiagnostics:
     def check_plugin_errors(self):
         """Check for plugin errors in Oxide logs.
 
-        Scans up to 10 most recent log files (entire content, not just tail)
-        to catch errors across the full uptime period.
+        Discovers the log directory, then scans up to 10 most recent log
+        files (entire content) to catch errors across the full uptime period.
         """
         if not self.ptero or not self.server_id:
             return None
 
         try:
+            # Ensure the log directory is discovered before reading files
+            log_dir = self._discover_oxide_log_dir()
+
             log_files = self.ptero.rust_get_oxide_logs(self.server_id, limit=15)
             if not log_files:
                 return {
                     "name": "check_plugin_errors",
                     "status": "info",
                     "severity": "low",
-                    "details": "No Oxide log files found. Checked oxide/logs and Oxide/Logs paths.",
+                    "details": f"No Oxide log files found. Log dir: {log_dir or 'not discovered'}",
                     "fix": None,
                     "category": "plugins",
                 }
@@ -1188,7 +1209,7 @@ class RustServerDiagnostics:
             errors = []
             files_scanned = 0
             total_lines = 0
-            for log_file in log_files[:10]:  # Scan last 10 log files
+            for log_file in log_files[:10]:
                 content = self._read_oxide_log(log_file["name"])
                 if not content:
                     continue
@@ -1196,9 +1217,13 @@ class RustServerDiagnostics:
                 lines = content.splitlines()
                 total_lines += len(lines)
                 for line in lines:
-                    if any(kw in line.lower() for kw in
+                    ll = line.lower()
+                    # Only match actual error indicators, skip [Info] lines
+                    if "[info]" in ll:
+                        continue
+                    if any(kw in ll for kw in
                            ("error", "exception", "nullref", "failed to",
-                            "unloaded", "compilation failed")):
+                            "unloaded", "compilation failed", "stacktrace")):
                         errors.append({
                             "file": log_file["name"],
                             "line": line.strip()[:200],
@@ -1207,7 +1232,6 @@ class RustServerDiagnostics:
             scan_info = f"Scanned {files_scanned} log file(s), {total_lines:,} lines"
 
             if errors:
-                # Deduplicate by line content, keep source info
                 seen = {}
                 for e in errors:
                     key = e["line"]
@@ -1608,10 +1632,16 @@ class RustServerDiagnostics:
         crash_indicators = []
         sources_checked = []
 
-        crash_keywords = ("crash", "segfault", "oom", "out of memory",
-                          "fatal", "unhandled exception", "stack overflow",
-                          "access violation", "killed", "terminated",
-                          "aborted", "sigsegv", "sigkill")
+        # Use specific phrases to avoid false positives from game events
+        # like "player was killed" or "entity terminated"
+        crash_keywords = (
+            "crash", "segfault", "sigsegv", "sigkill", "sigabrt",
+            "out of memory", "system.outofmemoryexception",
+            "unhandled exception", "stack overflow",
+            "access violation", "fatal error",
+            "application crashed", "server crashed",
+            "oom kill", "oom-kill",
+        )
 
         # 1. Check for crash files in /server/rust
         try:
@@ -1769,19 +1799,53 @@ class RustServerDiagnostics:
         total_files = 0
 
         # Keywords that indicate real problems (not just informational)
+        # For Oxide logs: skip [Info] lines, only match [Error]/[Warning] or
+        # lines with clear error indicators
         error_keywords = (
-            "error", "exception", "nullref", "failed to", "crash",
-            "fatal", "stack overflow", "out of memory", "oom",
-            "timeout", "timed out", "access violation", "segfault",
-            "compilation failed", "unloaded",
+            "exception", "nullref", "nullreferenceexception",
+            "failed to compile", "compilation failed",
+            "stacktrace", "stack overflow", "out of memory",
+            "access violation", "segfault",
+        )
+        # For non-Oxide logs (Steam, console): broader matching is ok
+        broad_error_keywords = (
+            "error", "exception", "failed", "crash", "fatal",
+            "timeout", "timed out",
         )
         warning_keywords = (
-            "warning", "deprecated", "slow", "lag",
-            "took too long", "performance",
+            "warning", "deprecated",
         )
+
+        def _classify_oxide_line(line):
+            """Classify an Oxide log line as error/warning/None."""
+            ll = line.lower()
+            # Oxide log format: [Oxide] HH:MM [Level] message
+            # or: [PluginName] message
+            if "[error]" in ll:
+                return "error"
+            if "[warning]" in ll or "[warn]" in ll:
+                return "warning"
+            # Skip [Info] lines entirely — they're not problems
+            if "[info]" in ll:
+                return None
+            # Check for error indicators in non-tagged lines
+            if any(kw in ll for kw in error_keywords):
+                return "error"
+            return None
+
+        def _classify_general_line(line):
+            """Classify a non-Oxide log line (Steam, console)."""
+            ll = line.lower()
+            if any(kw in ll for kw in broad_error_keywords):
+                return "error"
+            if any(kw in ll for kw in warning_keywords):
+                return "warning"
+            return None
 
         # 1. Scan Oxide logs — full content, up to 10 files
         try:
+            # Ensure log dir is discovered
+            self._discover_oxide_log_dir()
             log_files = self.ptero.rust_get_oxide_logs(self.server_id, limit=15)
             if log_files:
                 oxide_files_read = 0
@@ -1794,17 +1858,11 @@ class RustServerDiagnostics:
                     lines = content.splitlines()
                     total_lines += len(lines)
                     for line in lines:
-                        ll = line.lower()
-                        if any(kw in ll for kw in error_keywords):
+                        level = _classify_oxide_line(line)
+                        if level:
                             issues.append({
                                 "source": f"Oxide/{log_file['name']}",
-                                "level": "error",
-                                "line": line.strip()[:200],
-                            })
-                        elif any(kw in ll for kw in warning_keywords):
-                            issues.append({
-                                "source": f"Oxide/{log_file['name']}",
-                                "level": "warning",
+                                "level": level,
                                 "line": line.strip()[:200],
                             })
                 if oxide_files_read:
@@ -1825,11 +1883,11 @@ class RustServerDiagnostics:
                     lines = content.splitlines()
                     total_lines += len(lines)
                     for line in lines:
-                        ll = line.lower()
-                        if any(kw in ll for kw in error_keywords):
+                        level = _classify_general_line(line)
+                        if level:
                             issues.append({
                                 "source": f"Steam/{fname}",
-                                "level": "error",
+                                "level": level,
                                 "line": line.strip()[:200],
                             })
         except Exception:
@@ -1845,17 +1903,16 @@ class RustServerDiagnostics:
                     lines = content.splitlines()
                     total_lines += len(lines)
                     for line in lines:
-                        ll = line.lower()
-                        if any(kw in ll for kw in error_keywords):
+                        # Console output mixes Oxide and engine output;
+                        # use Oxide classifier for Oxide-tagged lines
+                        if "[oxide]" in line.lower() or re.match(r'\[.*\]\s', line):
+                            level = _classify_oxide_line(line)
+                        else:
+                            level = _classify_general_line(line)
+                        if level:
                             issues.append({
                                 "source": fname,
-                                "level": "error",
-                                "line": line.strip()[:200],
-                            })
-                        elif any(kw in ll for kw in warning_keywords):
-                            issues.append({
-                                "source": fname,
-                                "level": "warning",
+                                "level": level,
                                 "line": line.strip()[:200],
                             })
         except Exception:
