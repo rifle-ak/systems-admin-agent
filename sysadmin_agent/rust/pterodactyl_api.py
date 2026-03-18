@@ -3,9 +3,13 @@
 Supports both the Application API (admin) and Client API (server owner).
 Used for managing Rust game servers hosted on Pterodactyl/Wings.
 
+.. note:: Uses ``from __future__ import annotations`` for Python <3.10
+   compatibility with ``str | None`` type hints.
+
 API reference:
   https://dashflo.net/docs/api/pterodactyl/v1/
 """
+from __future__ import annotations
 
 import json
 import logging
