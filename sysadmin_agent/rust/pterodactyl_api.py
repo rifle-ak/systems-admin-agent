@@ -50,9 +50,15 @@ class PterodactylAPI:
     # Generic request helpers
     # ------------------------------------------------------------------
 
-    def _request(self, method, endpoint, data=None):
+    def _request(self, method, endpoint, data=None, raw_response=False):
         """Make an authenticated API request."""
-        url = f"{self._base}/{endpoint.lstrip('/')}"
+        # Build URL: strip slashes to avoid double-slash issues
+        endpoint = endpoint.strip("/")
+        if endpoint:
+            url = f"{self._base}/{endpoint}"
+        else:
+            url = self._base
+
         headers = {
             "Authorization": f"Bearer {self.api_key}",
             "Accept": "application/json",
@@ -62,30 +68,37 @@ class PterodactylAPI:
         body = json.dumps(data).encode("utf-8") if data else None
         req = Request(url, data=body, headers=headers, method=method)
 
+        logger.debug("Pterodactyl %s %s", method, url)
+
         try:
             with urlopen(req, timeout=self.timeout) as resp:
                 raw = resp.read().decode("utf-8")
+                if raw_response:
+                    return raw
                 if raw:
-                    return json.loads(raw)
+                    try:
+                        return json.loads(raw)
+                    except json.JSONDecodeError:
+                        return {"_raw": raw}
                 return {}
         except HTTPError as e:
-            body = ""
+            resp_body = ""
             try:
-                body = e.read().decode("utf-8")
+                resp_body = e.read().decode("utf-8")
             except Exception:
                 pass
             raise PterodactylAPIError(
-                f"API {method} {endpoint} failed: HTTP {e.code}",
+                f"API {method} {url} failed: HTTP {e.code}",
                 status_code=e.code,
-                response_body=body,
+                response_body=resp_body,
             )
         except URLError as e:
-            raise PterodactylAPIError(f"Connection failed: {e.reason}")
+            raise PterodactylAPIError(f"Connection to {self.panel_url} failed: {e.reason}")
         except Exception as e:
             raise PterodactylAPIError(f"Request failed: {e}")
 
-    def _get(self, endpoint):
-        return self._request("GET", endpoint)
+    def _get(self, endpoint, raw_response=False):
+        return self._request("GET", endpoint, raw_response=raw_response)
 
     def _post(self, endpoint, data=None):
         return self._request("POST", endpoint, data)
@@ -102,7 +115,10 @@ class PterodactylAPI:
 
     def list_servers(self) -> list:
         """List all servers the API key has access to."""
-        resp = self._get("/")
+        if self._is_application:
+            resp = self._get("servers")
+        else:
+            resp = self._get("")
         data = resp.get("data", [])
         servers = []
         for item in data:
@@ -169,11 +185,13 @@ class PterodactylAPI:
 
     def get_file_contents(self, server_id, file_path) -> str:
         """Read a file from the server."""
-        resp = self._get(f"/servers/{server_id}/files/contents?file={file_path}")
-        # This endpoint returns raw text, not JSON
-        if isinstance(resp, dict):
-            return json.dumps(resp)
-        return str(resp)
+        from urllib.parse import quote
+        encoded_path = quote(file_path, safe="/")
+        resp = self._get(
+            f"servers/{server_id}/files/contents?file={encoded_path}",
+            raw_response=True,
+        )
+        return resp if isinstance(resp, str) else str(resp)
 
     def write_file(self, server_id, file_path, content) -> dict:
         """Write content to a file on the server."""
