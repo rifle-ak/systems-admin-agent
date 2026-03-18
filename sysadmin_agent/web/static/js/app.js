@@ -157,6 +157,18 @@ function initSocket() {
     // rollback_result sends {snapshot_id, results: [...]}
     socket.on('rollback_result', onRollbackResult);
 
+    // ----- Rust server events -----
+    socket.on('rust_rcon_connected', onRconConnected);
+    socket.on('rust_rcon_disconnected', onRconDisconnected);
+    socket.on('rust_ptero_connected', onPteroConnected);
+    socket.on('rust_ptero_disconnected', onPteroDisconnected);
+    socket.on('rust_rcon_response', onRconResponse);
+    socket.on('rust_action_result', onRustActionResult);
+    socket.on('rust_diagnostics_result', onRustDiagnosticsResult);
+    socket.on('rust_lag_result', onRustLagResult);
+    socket.on('rust_plugin_result', onRustPluginResult);
+    socket.on('rust_ptero_result', onRustPteroResult);
+
     // ----- Error events -----
     socket.on('error', onServerError);
 
@@ -409,6 +421,9 @@ function onServerConnected(data) {
     if (connectBtn) connectBtn.style.display = 'none';
     if ($('#saveProfileBtn')) $('#saveProfileBtn').style.display = 'none';
     if (disconnectBtn) disconnectBtn.style.display = 'block';
+    // Show Rust admin panel
+    const rustAdmin = $('#rustAdmin');
+    if (rustAdmin) rustAdmin.style.display = 'block';
 
     // Disable form inputs
     if (connectForm) {
@@ -447,6 +462,9 @@ function onServerDisconnected() {
     if (connectBtn) connectBtn.style.display = '';
     if ($('#saveProfileBtn')) $('#saveProfileBtn').style.display = '';
     if (disconnectBtn) disconnectBtn.style.display = 'none';
+    // Hide Rust admin panel
+    const rustAdmin = $('#rustAdmin');
+    if (rustAdmin) rustAdmin.style.display = 'none';
 
     if (connectForm) {
         for (const input of connectForm.querySelectorAll('input, select')) {
@@ -1399,6 +1417,201 @@ async function saveBillingCycle() {
     } catch (e) {
         showFlash('Failed to save billing cycle', 'error');
     }
+}
+
+// ---------- Rust Server Admin ----------
+
+let rconConnected = false;
+let pteroConnected = false;
+
+function toggleRustPanel() {
+    const panel = $('#rustPanel');
+    const arrow = $('#rustToggle');
+    if (!panel) return;
+    const show = panel.style.display === 'none';
+    panel.style.display = show ? 'block' : 'none';
+    if (arrow) arrow.textContent = show ? '▾' : '▸';
+}
+
+function connectRcon() {
+    const host = ($('#rconHost') || {}).value || '';
+    const port = ($('#rconPort') || {}).value || '28016';
+    const password = ($('#rconPassword') || {}).value || '';
+    if (!host || !password) {
+        showFlash('RCON host and password are required', 'error');
+        return;
+    }
+    addMessage('system', 'Connecting to RCON...');
+    socket.emit('rust_connect_rcon', { host, port: parseInt(port), password });
+}
+
+function disconnectRcon() {
+    socket.emit('rust_disconnect_rcon', {});
+}
+
+function connectPtero() {
+    const baseUrl = ($('#pteroUrl') || {}).value || '';
+    const apiKey = ($('#pteroApiKey') || {}).value || '';
+    const serverId = ($('#pteroServerId') || {}).value || '';
+    if (!baseUrl || !apiKey) {
+        showFlash('Panel URL and API key are required', 'error');
+        return;
+    }
+    addMessage('system', 'Connecting to Pterodactyl Panel...');
+    socket.emit('rust_connect_pterodactyl', { base_url: baseUrl, api_key: apiKey, server_id: serverId });
+}
+
+function disconnectPtero() {
+    socket.emit('rust_disconnect_pterodactyl', {});
+}
+
+function onRconConnected(data) {
+    rconConnected = true;
+    if ($('#rconForm')) $('#rconForm').style.display = 'none';
+    if ($('#rconConnected')) $('#rconConnected').style.display = 'flex';
+    if ($('#rustActions')) $('#rustActions').style.display = 'block';
+
+    let msg = 'RCON connected.';
+    if (data.server_info) {
+        msg += '\n```\n' + escapeHtml(data.server_info) + '\n```';
+    }
+    addMessage('system', msg);
+}
+
+function onRconDisconnected() {
+    rconConnected = false;
+    if ($('#rconForm')) $('#rconForm').style.display = 'block';
+    if ($('#rconConnected')) $('#rconConnected').style.display = 'none';
+    if (!pteroConnected) {
+        if ($('#rustActions')) $('#rustActions').style.display = 'none';
+    }
+    addMessage('system', 'RCON disconnected.');
+}
+
+function onPteroConnected(data) {
+    pteroConnected = true;
+    if ($('#pteroForm')) $('#pteroForm').style.display = 'none';
+    if ($('#pteroConnected')) $('#pteroConnected').style.display = 'flex';
+
+    let msg = 'Pterodactyl Panel connected.';
+    if (data.servers && data.servers.length > 0) {
+        msg += ` Found ${data.servers.length} server(s).`;
+    }
+    addMessage('system', msg);
+}
+
+function onPteroDisconnected() {
+    pteroConnected = false;
+    if ($('#pteroForm')) $('#pteroForm').style.display = 'block';
+    if ($('#pteroConnected')) $('#pteroConnected').style.display = 'none';
+    addMessage('system', 'Pterodactyl Panel disconnected.');
+}
+
+function sendRconCommand() {
+    const input = $('#rconCommand');
+    if (!input) return;
+    const cmd = input.value.trim();
+    if (!cmd) return;
+    input.value = '';
+    addMessage('user', `RCON: ${escapeHtml(cmd)}`);
+    socket.emit('rust_rcon_command', { command: cmd });
+}
+
+function onRconResponse(data) {
+    const response = data.response || '(no output)';
+    addMessage('agent', `<strong>RCON &gt; ${escapeHtml(data.command)}</strong>\n<pre class="rcon-output">${escapeHtml(response)}</pre>`);
+}
+
+function rustAction(action) {
+    addMessage('system', `Running: ${action}...`);
+    socket.emit('rust_quick_action', { action });
+}
+
+function onRustActionResult(data) {
+    const action = data.action || 'action';
+    const result = typeof data.result === 'string' ? data.result : JSON.stringify(data.result, null, 2);
+    addMessage('agent', `<strong>${escapeHtml(action)}</strong>\n<pre class="rcon-output">${escapeHtml(result)}</pre>`);
+}
+
+function rustRunDiagnostics() {
+    addMessage('system', 'Running Rust server diagnostics...');
+    socket.emit('rust_run_diagnostics', {});
+}
+
+function rustDiagnoseLag() {
+    addMessage('system', 'Diagnosing lag and rubber-banding...');
+    socket.emit('rust_diagnose_lag', {});
+}
+
+function onRustDiagnosticsResult(data) {
+    removeMessage('progress-msg');
+    const results = data.diagnostics || [];
+    if (results.length === 0) {
+        addMessage('agent', 'No diagnostic results.');
+        return;
+    }
+    const table = renderRustDiagnostics(results);
+    addMessage('agent', table);
+}
+
+function onRustLagResult(data) {
+    removeMessage('progress-msg');
+    const diagnosis = data.diagnosis || [];
+    if (diagnosis.length === 0) {
+        addMessage('agent', 'No lag issues detected.');
+        return;
+    }
+    let html = '<strong>Lag Diagnosis</strong> (ranked by probability)<br><br>';
+    html += '<table class="diag-table"><thead><tr><th>Check</th><th>Status</th><th>Severity</th><th>Details</th></tr></thead><tbody>';
+    for (const item of diagnosis) {
+        const sevClass = item.severity === 'critical' ? 'diag-critical' :
+                         item.severity === 'high' ? 'diag-high' :
+                         item.severity === 'warning' ? 'diag-warning' : 'diag-ok';
+        html += `<tr class="${sevClass}">`;
+        html += `<td>${escapeHtml(item.name || item.check || '')}</td>`;
+        html += `<td>${escapeHtml(item.status || '')}</td>`;
+        html += `<td>${escapeHtml(item.severity || '')}</td>`;
+        html += `<td>${escapeHtml(item.message || item.details || '')}</td>`;
+        html += `</tr>`;
+    }
+    html += '</tbody></table>';
+    addMessage('agent', html);
+}
+
+function renderRustDiagnostics(results) {
+    let html = '<strong>Rust Server Diagnostics</strong><br><br>';
+    html += '<table class="diag-table"><thead><tr><th>Check</th><th>Status</th><th>Severity</th><th>Details</th></tr></thead><tbody>';
+    for (const r of results) {
+        const sevClass = r.severity === 'critical' ? 'diag-critical' :
+                         r.severity === 'high' ? 'diag-high' :
+                         r.severity === 'warning' ? 'diag-warning' : 'diag-ok';
+        html += `<tr class="${sevClass}">`;
+        html += `<td>${escapeHtml(r.name || '')}</td>`;
+        html += `<td>${escapeHtml(r.status || '')}</td>`;
+        html += `<td>${escapeHtml(r.severity || '')}</td>`;
+        html += `<td>${escapeHtml(r.message || '')}</td>`;
+        html += `</tr>`;
+    }
+    html += '</tbody></table>';
+    return html;
+}
+
+function onRustPluginResult(data) {
+    const action = data.action || '';
+    const plugin = data.plugin || '';
+    if (action === 'get_config' && data.config) {
+        const config = typeof data.config === 'string' ? data.config : JSON.stringify(data.config, null, 2);
+        addMessage('agent', `<strong>${escapeHtml(plugin)} Config</strong>\n<pre class="rcon-output">${escapeHtml(config)}</pre>`);
+    } else {
+        const result = typeof data.result === 'string' ? data.result : JSON.stringify(data.result, null, 2);
+        addMessage('agent', `<strong>Plugin ${escapeHtml(action)}: ${escapeHtml(plugin)}</strong>\n<pre class="rcon-output">${escapeHtml(result)}</pre>`);
+    }
+}
+
+function onRustPteroResult(data) {
+    const action = data.action || '';
+    const result = typeof data.result === 'string' ? data.result : JSON.stringify(data.result, null, 2);
+    addMessage('agent', `<strong>Pterodactyl: ${escapeHtml(action)}</strong>\n<pre class="rcon-output">${escapeHtml(result)}</pre>`);
 }
 
 // ---------- Dashboard Init ----------

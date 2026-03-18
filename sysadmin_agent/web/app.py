@@ -116,6 +116,10 @@ _conversations: dict[str, list] = {}
 _pending_approvals: dict[str, dict] = {}
 # sid -> AgentBrain (persistent per session for token tracking)
 _brains: dict[str, object] = {}
+# sid -> RconClient
+_rcon_connections: dict[str, object] = {}
+# sid -> PterodactylAPI
+_ptero_connections: dict[str, object] = {}
 
 APPROVAL_TIMEOUT = 60  # seconds
 
@@ -721,6 +725,14 @@ def handle_disconnect():
     _session_data.pop(sid, None)
     _conversations.pop(sid, None)
     _brains.pop(sid, None)
+    # Clean up Rust connections
+    rcon = _rcon_connections.pop(sid, None)
+    if rcon:
+        try:
+            rcon.disconnect()
+        except Exception:
+            pass
+    _ptero_connections.pop(sid, None)
 
 
 @socketio.on("connect_server")
@@ -816,6 +828,13 @@ def handle_disconnect_server(data=None):
     _session_data.pop(sid, None)
     _conversations.pop(sid, None)
     _brains.pop(sid, None)
+    rcon = _rcon_connections.pop(sid, None)
+    if rcon:
+        try:
+            rcon.disconnect()
+        except Exception:
+            pass
+    _ptero_connections.pop(sid, None)
     emit("server_disconnected", {"message": "Disconnected from server."})
 
 
@@ -1342,6 +1361,322 @@ def do_restart():
 
     threading.Thread(target=_restart, daemon=True).start()
     return jsonify({"status": "ok", "message": "Restarting..."})
+
+
+# ---------------------------------------------------------------------------
+# SocketIO Events — Rust Server Administration
+# ---------------------------------------------------------------------------
+
+@socketio.on("rust_connect_rcon")
+def handle_rust_connect_rcon(data):
+    """Connect to a Rust server via RCON."""
+    sid = request.sid
+    host = (data.get("host") or "").strip()
+    port = data.get("port", 28016)
+    password = (data.get("password") or "").strip()
+
+    if not host or not password:
+        emit("error", {"message": "RCON host and password are required."})
+        return
+
+    try:
+        port = int(port)
+    except (ValueError, TypeError):
+        emit("error", {"message": "Invalid RCON port."})
+        return
+
+    try:
+        from sysadmin_agent.rust.rcon_client import RCONClient
+        rcon = RCONClient(host, port, password)
+        rcon.connect()
+        _rcon_connections[sid] = rcon
+
+        # Get initial server info
+        info = rcon.server_info()
+        emit("rust_rcon_connected", {"server_info": info})
+    except Exception as exc:
+        logger.exception("RCON connect failed")
+        emit("error", {"message": f"RCON connection failed: {exc}"})
+
+
+@socketio.on("rust_disconnect_rcon")
+def handle_rust_disconnect_rcon(data=None):
+    """Disconnect RCON."""
+    sid = request.sid
+    rcon = _rcon_connections.pop(sid, None)
+    if rcon:
+        try:
+            rcon.disconnect()
+        except Exception:
+            pass
+    emit("rust_rcon_disconnected", {})
+
+
+@socketio.on("rust_connect_pterodactyl")
+def handle_rust_connect_pterodactyl(data):
+    """Connect to Pterodactyl Panel API."""
+    sid = request.sid
+    base_url = (data.get("base_url") or "").strip().rstrip("/")
+    api_key = (data.get("api_key") or "").strip()
+    server_id = (data.get("server_id") or "").strip()
+
+    if not base_url or not api_key:
+        emit("error", {"message": "Panel URL and API key are required."})
+        return
+
+    try:
+        from sysadmin_agent.rust.pterodactyl_api import PterodactylAPI
+        ptero = PterodactylAPI(base_url, api_key)
+
+        # Verify connection by listing servers
+        servers = ptero.list_servers()
+
+        _ptero_connections[sid] = {"api": ptero, "server_id": server_id}
+        emit("rust_ptero_connected", {
+            "servers": servers,
+            "selected_server": server_id,
+        })
+    except Exception as exc:
+        logger.exception("Pterodactyl connect failed")
+        emit("error", {"message": f"Pterodactyl connection failed: {exc}"})
+
+
+@socketio.on("rust_disconnect_pterodactyl")
+def handle_rust_disconnect_pterodactyl(data=None):
+    """Disconnect Pterodactyl."""
+    sid = request.sid
+    _ptero_connections.pop(sid, None)
+    emit("rust_ptero_disconnected", {})
+
+
+@socketio.on("rust_rcon_command")
+def handle_rust_rcon_command(data):
+    """Send an arbitrary RCON command."""
+    sid = request.sid
+    rcon = _rcon_connections.get(sid)
+    if not rcon:
+        emit("error", {"message": "Not connected to RCON."})
+        return
+
+    command = (data.get("command") or "").strip()
+    if not command:
+        emit("error", {"message": "Empty command."})
+        return
+
+    try:
+        response = rcon.command(command)
+        emit("rust_rcon_response", {"command": command, "response": response})
+    except Exception as exc:
+        logger.warning("RCON command failed: %s", exc)
+        # Try to reconnect
+        try:
+            rcon.disconnect()
+        except Exception:
+            pass
+        _rcon_connections.pop(sid, None)
+        emit("error", {"message": f"RCON command failed (disconnected): {exc}"})
+
+
+@socketio.on("rust_quick_action")
+def handle_rust_quick_action(data):
+    """Execute a Rust server quick action via RCON."""
+    sid = request.sid
+    rcon = _rcon_connections.get(sid)
+    if not rcon:
+        emit("error", {"message": "Not connected to RCON."})
+        return
+
+    action = (data.get("action") or "").strip()
+    actions_map = {
+        "server_info": lambda: rcon.server_info(),
+        "status": lambda: rcon.status(),
+        "fps": lambda: rcon.get_fps(),
+        "entity_count": lambda: rcon.entity_count(),
+        "player_list": lambda: rcon.player_list(),
+        "performance": lambda: rcon.performance_report(),
+        "force_save": lambda: rcon.force_save(),
+        "gc_collect": lambda: rcon.gc_collect(),
+        "oxide_plugins": lambda: rcon.oxide_plugins(),
+        "oxide_version": lambda: rcon.oxide_version(),
+        "pool_status": lambda: rcon.pool_status(),
+    }
+
+    handler = actions_map.get(action)
+    if not handler:
+        emit("error", {"message": f"Unknown quick action: {action}"})
+        return
+
+    try:
+        result = handler()
+        emit("rust_action_result", {"action": action, "result": result})
+    except Exception as exc:
+        logger.warning("Rust quick action '%s' failed: %s", action, exc)
+        emit("error", {"message": f"Action '{action}' failed: {exc}"})
+
+
+@socketio.on("rust_run_diagnostics")
+def handle_rust_run_diagnostics(data=None):
+    """Run comprehensive Rust server diagnostics."""
+    sid = request.sid
+    rcon = _rcon_connections.get(sid)
+    ptero_data = _ptero_connections.get(sid)
+    ssh = _get_ssh(sid)
+
+    if not rcon:
+        emit("error", {"message": "RCON connection required for Rust diagnostics."})
+        return
+
+    ptero = ptero_data["api"] if ptero_data else None
+    server_id = ptero_data.get("server_id") if ptero_data else None
+
+    try:
+        from sysadmin_agent.rust.rust_diagnostics import RustServerDiagnostics
+
+        emit("status", {"message": "Running Rust server diagnostics..."})
+        diag = RustServerDiagnostics(rcon, ptero=ptero, server_id=server_id, ssh=ssh)
+        results = diag.run_all()
+
+        emit("rust_diagnostics_result", {"diagnostics": results})
+    except Exception as exc:
+        logger.exception("Rust diagnostics failed")
+        emit("error", {"message": f"Rust diagnostics failed: {exc}"})
+
+
+@socketio.on("rust_diagnose_lag")
+def handle_rust_diagnose_lag(data=None):
+    """Run focused lag/rubber-banding diagnosis."""
+    sid = request.sid
+    rcon = _rcon_connections.get(sid)
+    ptero_data = _ptero_connections.get(sid)
+    ssh = _get_ssh(sid)
+
+    if not rcon:
+        emit("error", {"message": "RCON connection required for lag diagnosis."})
+        return
+
+    ptero = ptero_data["api"] if ptero_data else None
+    server_id = ptero_data.get("server_id") if ptero_data else None
+
+    try:
+        from sysadmin_agent.rust.rust_diagnostics import RustServerDiagnostics
+
+        emit("status", {"message": "Diagnosing lag and rubber-banding..."})
+        diag = RustServerDiagnostics(rcon, ptero=ptero, server_id=server_id, ssh=ssh)
+        results = diag.run_lag_diagnosis()
+
+        emit("rust_lag_result", {"diagnosis": results})
+    except Exception as exc:
+        logger.exception("Lag diagnosis failed")
+        emit("error", {"message": f"Lag diagnosis failed: {exc}"})
+
+
+@socketio.on("rust_plugin_action")
+def handle_rust_plugin_action(data):
+    """Manage Oxide plugins: reload, get config, update config."""
+    sid = request.sid
+    rcon = _rcon_connections.get(sid)
+    ptero_data = _ptero_connections.get(sid)
+
+    if not rcon:
+        emit("error", {"message": "RCON connection required."})
+        return
+
+    action = (data.get("action") or "").strip()
+    plugin_name = (data.get("plugin") or "").strip()
+
+    if not action or not plugin_name:
+        emit("error", {"message": "Action and plugin name are required."})
+        return
+
+    try:
+        from sysadmin_agent.rust.rust_diagnostics import RustServerDiagnostics
+
+        ptero = ptero_data["api"] if ptero_data else None
+        server_id = ptero_data.get("server_id") if ptero_data else None
+        diag = RustServerDiagnostics(rcon, ptero=ptero, server_id=server_id)
+
+        if action == "reload":
+            result = diag.reload_plugin(plugin_name)
+            emit("rust_plugin_result", {
+                "action": "reload",
+                "plugin": plugin_name,
+                "result": result,
+            })
+        elif action == "get_config":
+            config = diag.get_plugin_config(plugin_name)
+            emit("rust_plugin_result", {
+                "action": "get_config",
+                "plugin": plugin_name,
+                "config": config,
+            })
+        elif action == "update_config":
+            config_data = data.get("config", {})
+            result = diag.update_plugin_config(plugin_name, config_data)
+            emit("rust_plugin_result", {
+                "action": "update_config",
+                "plugin": plugin_name,
+                "result": result,
+            })
+        else:
+            emit("error", {"message": f"Unknown plugin action: {action}"})
+    except Exception as exc:
+        logger.warning("Plugin action failed: %s", exc)
+        emit("error", {"message": f"Plugin action failed: {exc}"})
+
+
+@socketio.on("rust_ptero_action")
+def handle_rust_ptero_action(data):
+    """Pterodactyl server management actions."""
+    sid = request.sid
+    ptero_data = _ptero_connections.get(sid)
+    if not ptero_data:
+        emit("error", {"message": "Not connected to Pterodactyl."})
+        return
+
+    ptero = ptero_data["api"]
+    server_id = data.get("server_id") or ptero_data.get("server_id")
+    if not server_id:
+        emit("error", {"message": "No server selected."})
+        return
+
+    action = (data.get("action") or "").strip()
+
+    try:
+        if action == "resources":
+            result = ptero.get_resources(server_id)
+        elif action == "start":
+            result = ptero.set_power_state(server_id, "start")
+        elif action == "stop":
+            result = ptero.set_power_state(server_id, "stop")
+        elif action == "restart":
+            result = ptero.set_power_state(server_id, "restart")
+        elif action == "kill":
+            result = ptero.set_power_state(server_id, "kill")
+        elif action == "list_files":
+            directory = data.get("directory", "/")
+            result = ptero.list_files(server_id, directory)
+        elif action == "get_file":
+            file_path = data.get("file_path", "")
+            result = ptero.get_file_contents(server_id, file_path)
+        elif action == "oxide_plugins":
+            result = ptero.rust_list_oxide_plugins(server_id)
+        elif action == "oxide_config":
+            plugin = data.get("plugin", "")
+            result = ptero.rust_get_oxide_config(server_id, plugin)
+        elif action == "oxide_logs":
+            result = ptero.rust_get_oxide_logs(server_id)
+        elif action == "server_cfg":
+            result = ptero.rust_get_server_cfg(server_id)
+        elif action == "backups":
+            result = ptero.list_backups(server_id)
+        else:
+            emit("error", {"message": f"Unknown Pterodactyl action: {action}"})
+            return
+
+        emit("rust_ptero_result", {"action": action, "result": result})
+    except Exception as exc:
+        logger.warning("Pterodactyl action '%s' failed: %s", action, exc)
+        emit("error", {"message": f"Pterodactyl action failed: {exc}"})
 
 
 # ---------------------------------------------------------------------------

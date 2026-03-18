@@ -110,6 +110,95 @@
                 </button>
             </div>
         </div>
+
+        <!-- Rust Server Admin -->
+        <div class="sidebar-section" id="rustAdmin" style="display: none;">
+            <h3 class="sidebar-heading" onclick="toggleRustPanel()" style="cursor:pointer;">
+                Rust Server Admin
+                <span class="toggle-arrow" id="rustToggle">▸</span>
+            </h3>
+            <div id="rustPanel" style="display: none;">
+                <!-- RCON Connection -->
+                <div class="rust-subsection">
+                    <label class="sub-heading">RCON</label>
+                    <div id="rconForm">
+                        <div class="form-group">
+                            <input type="text" id="rconHost" class="form-input form-input-sm" placeholder="RCON host (e.g. 192.168.1.100)">
+                        </div>
+                        <div class="form-row">
+                            <div class="form-group flex-grow">
+                                <input type="number" id="rconPort" class="form-input form-input-sm" value="28016" placeholder="Port">
+                            </div>
+                            <div class="form-group flex-grow">
+                                <input type="password" id="rconPassword" class="form-input form-input-sm" placeholder="RCON password">
+                            </div>
+                        </div>
+                        <button class="btn btn-small btn-primary btn-full" id="rconConnectBtn" onclick="connectRcon()">Connect RCON</button>
+                    </div>
+                    <div id="rconConnected" style="display: none;">
+                        <span class="status-badge status-ok">RCON Connected</span>
+                        <button class="btn btn-small btn-danger" onclick="disconnectRcon()">Disconnect</button>
+                    </div>
+                </div>
+
+                <!-- Pterodactyl Connection -->
+                <div class="rust-subsection">
+                    <label class="sub-heading">Pterodactyl Panel</label>
+                    <div id="pteroForm">
+                        <div class="form-group">
+                            <input type="text" id="pteroUrl" class="form-input form-input-sm" placeholder="https://panel.example.com">
+                        </div>
+                        <div class="form-group">
+                            <input type="password" id="pteroApiKey" class="form-input form-input-sm" placeholder="API key (ptlc_...)">
+                        </div>
+                        <div class="form-group">
+                            <input type="text" id="pteroServerId" class="form-input form-input-sm" placeholder="Server ID (short hash)">
+                        </div>
+                        <button class="btn btn-small btn-primary btn-full" id="pteroConnectBtn" onclick="connectPtero()">Connect Panel</button>
+                    </div>
+                    <div id="pteroConnected" style="display: none;">
+                        <span class="status-badge status-ok">Panel Connected</span>
+                        <button class="btn btn-small btn-danger" onclick="disconnectPtero()">Disconnect</button>
+                    </div>
+                </div>
+
+                <!-- Rust Quick Actions -->
+                <div class="rust-subsection" id="rustActions" style="display: none;">
+                    <label class="sub-heading">Quick Actions</label>
+                    <div class="action-buttons action-buttons-compact">
+                        <button class="btn btn-action btn-action-sm" onclick="rustAction('server_info')" title="Server Info">Info</button>
+                        <button class="btn btn-action btn-action-sm" onclick="rustAction('fps')" title="Server FPS">FPS</button>
+                        <button class="btn btn-action btn-action-sm" onclick="rustAction('player_list')" title="Player List">Players</button>
+                        <button class="btn btn-action btn-action-sm" onclick="rustAction('entity_count')" title="Entity Count">Entities</button>
+                        <button class="btn btn-action btn-action-sm" onclick="rustAction('performance')" title="Performance Report">Perf</button>
+                        <button class="btn btn-action btn-action-sm" onclick="rustAction('oxide_plugins')" title="List Plugins">Plugins</button>
+                        <button class="btn btn-action btn-action-sm btn-action-warn" onclick="rustAction('force_save')" title="Force Save">Save</button>
+                        <button class="btn btn-action btn-action-sm btn-action-warn" onclick="rustAction('gc_collect')" title="Garbage Collect">GC</button>
+                    </div>
+                    <div class="action-buttons" style="margin-top: 0.5rem;">
+                        <button class="btn btn-action" onclick="rustRunDiagnostics()">
+                            <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2">
+                                <path d="M22 12h-4l-3 9L9 3l-3 9H2"/>
+                            </svg>
+                            Full Diagnostics
+                        </button>
+                        <button class="btn btn-action btn-action-warn" onclick="rustDiagnoseLag()">
+                            <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2">
+                                <circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/>
+                            </svg>
+                            Diagnose Lag
+                        </button>
+                    </div>
+                    <!-- RCON Console -->
+                    <div class="form-group" style="margin-top: 0.5rem;">
+                        <div class="form-row">
+                            <input type="text" id="rconCommand" class="form-input form-input-sm flex-grow" placeholder="RCON command..." onkeydown="if(event.key==='Enter')sendRconCommand()">
+                            <button class="btn btn-small btn-primary" onclick="sendRconCommand()">Send</button>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
     </aside>
 
     <!-- Main Chat Area -->
