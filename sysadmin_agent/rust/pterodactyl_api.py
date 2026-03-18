@@ -356,36 +356,47 @@ class PterodactylAPI:
     def rust_get_server_cfg(self, server_id) -> str:
         """Read the Rust server configuration file.
 
-        Checks multiple paths: server.cfg, serverauto.cfg, and alternate
-        directory layouts.
+        Searches multiple container roots and config file names since
+        the layout varies by Pterodactyl egg.
         """
-        cfg_paths = [
-            "/server/rust/cfg/server.cfg",
-            "/server/rust/server.cfg",
-            "/server/rust/cfg/serverauto.cfg",
-        ]
-        for path in cfg_paths:
-            try:
-                content = self.get_file_contents(server_id, path)
-                if content and content.strip():
-                    return content
-            except PterodactylAPIError:
-                continue
+        roots = ["/server/rust", "/", "/home/container", "/server"]
+        cfg_names = ["cfg/server.cfg", "server.cfg", "cfg/serverauto.cfg",
+                     "serverauto.cfg"]
+        for root in roots:
+            for name in cfg_names:
+                path = f"{root}/{name}" if root != "/" else f"/{name}"
+                try:
+                    content = self.get_file_contents(server_id, path)
+                    if content and content.strip():
+                        return content
+                except PterodactylAPIError:
+                    continue
         return ""
 
     def _discover_oxide_root(self, server_id) -> str | None:
-        """Discover the actual Oxide root directory by listing /server/rust/.
+        """Discover the actual Oxide root directory.
 
-        Oxide can be installed as 'oxide', 'Oxide', or other casings.
-        Returns the full path like '/server/rust/oxide' or None.
+        Searches multiple possible parent directories since the container
+        layout varies by egg/setup. The Pterodactyl file API root is the
+        container root, so paths may be /oxide/, /server/rust/oxide/, etc.
+
+        Returns the full path like '/server/rust/oxide' or '/oxide' or None.
         """
-        try:
-            files = self.list_files(server_id, "/server/rust")
-            for f in files:
-                if not f["is_file"] and f["name"].lower() == "oxide":
-                    return f"/server/rust/{f['name']}"
-        except PterodactylAPIError:
-            pass
+        search_roots = [
+            "/server/rust",
+            "/",
+            "/home/container",
+            "/server",
+        ]
+        for root in search_roots:
+            try:
+                files = self.list_files(server_id, root)
+                for f in files:
+                    if not f["is_file"] and f["name"].lower() == "oxide":
+                        path = f"{root}/{f['name']}" if root != "/" else f"/{f['name']}"
+                        return path
+            except PterodactylAPIError:
+                continue
         return None
 
     def _discover_oxide_subdirs(self, server_id, oxide_root) -> dict:
