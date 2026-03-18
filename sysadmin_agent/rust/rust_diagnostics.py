@@ -35,12 +35,14 @@ class RustServerDiagnostics:
     """
 
     def __init__(self, rcon=None, ptero=None, server_id=None, ssh=None,
-                 on_progress=None):
+                 on_progress=None, server_limits=None):
         self.rcon = rcon
         self.ptero = ptero
         self.server_id = server_id
         self.ssh = ssh
         self._on_progress = on_progress  # callback(message_str)
+        # Server limits from Pterodactyl (cpu: 0=unlimited, memory in MB, etc.)
+        self._server_limits = server_limits or {}
 
         self._checks = [
             self.check_server_fps,
@@ -206,25 +208,45 @@ class RustServerDiagnostics:
                 raw["mem_pct"] = mem_pct
                 raw["uptime_hrs"] = uptime_hrs
 
-                if cpu > 95:
-                    findings.append({
-                        "cause": "CPU maxed out",
-                        "severity": "critical",
-                        "details": f"CPU at {cpu:.1f}%. The server is completely saturated — "
-                                   "it cannot process ticks fast enough, which directly causes rubber-banding.",
-                        "likely_reason": "Too many entities for the allocated CPU, or a plugin is consuming excessive CPU",
-                        "fix": "Reduce entity count (wipe), check for CPU-hungry plugins with `perf` command, "
-                               "or upgrade server CPU allocation in Pterodactyl.",
-                    })
-                elif cpu > 80:
-                    findings.append({
-                        "cause": "High CPU usage",
-                        "severity": "high",
-                        "details": f"CPU at {cpu:.1f}%. Approaching saturation. "
-                                   f"Tick rate will start dropping as load increases.",
-                        "likely_reason": "High entity count and/or heavy plugin load",
-                        "fix": "Monitor closely. If CPU hits 95%+, lag will become constant.",
-                    })
+                # Evaluate CPU usage against the allocated limit
+                # cpu_absolute is % of a single core (200% = 2 full cores)
+                # CPU limit: 0 = unlimited, otherwise the cap in same units
+                cpu_limit = self._server_limits.get("cpu", 0)
+                raw["cpu_limit"] = cpu_limit
+
+                if cpu_limit and cpu_limit > 0:
+                    # Server has a CPU cap — check usage as % of that cap
+                    cpu_pct_of_limit = (cpu / cpu_limit) * 100
+                    if cpu_pct_of_limit > 95:
+                        findings.append({
+                            "cause": "CPU at allocation limit",
+                            "severity": "critical",
+                            "details": f"CPU at {cpu:.1f}% of {cpu_limit}% limit "
+                                       f"({cpu_pct_of_limit:.0f}% of allocation used). "
+                                       "The server is hitting its CPU cap — Pterodactyl will throttle it, "
+                                       "which directly causes rubber-banding.",
+                            "likely_reason": "CPU allocation too low for current server load, "
+                                             "or plugins/entities consuming too much CPU",
+                            "fix": "Increase CPU limit in Pterodactyl, reduce entity count, "
+                                   "or identify CPU-hungry plugins.",
+                        })
+                    elif cpu_pct_of_limit > 80:
+                        findings.append({
+                            "cause": "CPU nearing allocation limit",
+                            "severity": "high",
+                            "details": f"CPU at {cpu:.1f}% of {cpu_limit}% limit "
+                                       f"({cpu_pct_of_limit:.0f}% of allocation used). "
+                                       "Approaching the cap — throttling may start soon.",
+                            "likely_reason": "Growing server load approaching the CPU allocation",
+                            "fix": "Monitor closely. Consider increasing CPU limit or reducing load.",
+                        })
+                else:
+                    # CPU limit is 0 (unlimited) — >100% just means using multiple cores
+                    # This is normal for Rust. Only flag if FPS is also low.
+                    cpu_info = f"CPU at {cpu:.1f}% (no limit set — using ~{cpu/100:.1f} cores)"
+                    raw["cpu_info"] = cpu_info
+                    # We don't flag unlimited CPU as a problem on its own.
+                    # The cross-correlation engine will catch it if FPS is also low.
 
                 if mem_pct > 90:
                     findings.append({
@@ -268,8 +290,14 @@ class RustServerDiagnostics:
                 })
 
         # 4. Plugin performance (perf hooks)
+        # "perf" alone just shows/toggles the perf level setting.
+        # We need to enable profiling (perf 2), wait for data to accumulate,
+        # then read the results. If perf is already enabled, just read.
         self._progress(f"[4/{total_steps}] Profiling plugin hook performance...")
-        perf_result = self._safe_rcon("perf")
+        # Enable perf level 6 (detailed hooks) then read after a short pause
+        self._safe_rcon("perf 6")
+        time.sleep(3)  # Let profiling data accumulate for a few seconds
+        perf_result = self._safe_rcon("perf 0")  # Disable and read results
         raw["perf"] = perf_result
         if perf_result:
             slow_hooks = self._parse_perf_hooks(perf_result)
@@ -370,7 +398,14 @@ class RustServerDiagnostics:
             errored_plugins = []
             for line in oxide_result.splitlines():
                 stripped = line.strip()
-                if any(kw in stripped.lower() for kw in ("error", "failed", "crash", "unloaded")):
+                if not stripped:
+                    continue
+                # Oxide plugin lines: 87 "Plugin Name" (ver) by Author ... - File.cs
+                # Strip the quoted plugin name before checking for error keywords,
+                # so "Nav Mesh Error Fix" doesn't trigger a false positive.
+                line_without_name = re.sub(r'"[^"]*"', '""', stripped)
+                if any(kw in line_without_name.lower() for kw in
+                       ("error", "failed", "crash", "unloaded", "not loaded")):
                     errored_plugins.append(stripped[:120])
             if errored_plugins:
                 findings.append({
@@ -529,16 +564,25 @@ class RustServerDiagnostics:
                        "  4. Manually remove massive abandoned bases",
             }
 
-        if cpu and cpu > 90 and fps and fps < 20 and (not entities or entities < 200000):
+        # CPU root cause — only if there's a limit and we're hitting it
+        cpu_limit = raw.get("cpu_limit", 0)
+        cpu_is_capped = False
+        if cpu and cpu_limit and cpu_limit > 0:
+            cpu_is_capped = (cpu / cpu_limit) * 100 > 90
+
+        if cpu_is_capped and fps and fps < 20 and (not entities or entities < 200000):
             return {
-                "cause": "ROOT CAUSE: CPU is maxed out (not entity-related)",
+                "cause": "ROOT CAUSE: CPU hitting allocation limit (not entity-related)",
                 "severity": "critical",
-                "details": f"CPU is at {cpu:.1f}% but entity count is {'only ' + f'{entities:,}' if entities else 'unknown'}. "
-                           "This means something other than entities is consuming CPU — "
+                "details": f"CPU is at {cpu:.1f}% of {cpu_limit}% limit, but entity count is "
+                           f"{'only ' + f'{entities:,}' if entities else 'unknown'}. "
+                           "The server is being throttled by Pterodactyl's CPU cap. "
+                           "Something other than entities is consuming CPU — "
                            "likely one or more plugins running expensive operations.",
-                "likely_reason": "Plugin performance issue or too many players for server allocation",
-                "fix": "Check the plugin performance findings above. Disable plugins one at a time "
-                       "to identify the CPU hog. Or upgrade server CPU allocation.",
+                "likely_reason": "Plugin performance issue, CPU allocation too low, "
+                                 "or too many players for server allocation",
+                "fix": "Increase CPU limit in Pterodactyl, or check plugin performance findings above. "
+                       "Disable plugins one at a time to identify the CPU hog.",
             }
 
         if mem_pct and mem_pct > 90:
@@ -708,9 +752,17 @@ class RustServerDiagnostics:
         disk_mb = disk_bytes // (1024 * 1024)
         uptime_hrs = uptime // (1000 * 3600)
 
+        # CPU limit from Pterodactyl: 0 = unlimited
+        cpu_limit = self._server_limits.get("cpu", 0)
+        if cpu_limit and cpu_limit > 0:
+            cpu_pct_of_limit = (cpu / cpu_limit) * 100
+            cpu_str = f"CPU: {cpu:.1f}% of {cpu_limit}% limit ({cpu_pct_of_limit:.0f}% used)"
+        else:
+            cpu_str = f"CPU: {cpu:.1f}% (~{cpu/100:.1f} cores, no limit)"
+
         parts = [
             f"State: {state}",
-            f"CPU: {cpu:.1f}%",
+            cpu_str,
             f"Memory: {mem_mb}MB / {mem_limit_mb}MB ({mem_pct:.1f}%)" if mem_limit_mb else f"Memory: {mem_mb}MB",
             f"Disk: {disk_mb}MB",
             f"Net: {net_rx // (1024*1024)}MB rx / {net_tx // (1024*1024)}MB tx",
@@ -729,15 +781,19 @@ class RustServerDiagnostics:
                 "category": "resources",
             }
 
-        if cpu > 95:
-            return {
-                "name": "check_server_resources",
-                "status": "critical",
-                "severity": "high",
-                "details": " | ".join(parts) + " — CPU is maxed out!",
-                "fix": None,
-                "category": "resources",
-            }
+        # Only flag CPU as critical if there's an actual limit being hit
+        if cpu_limit and cpu_limit > 0:
+            cpu_pct_of_limit = (cpu / cpu_limit) * 100
+            if cpu_pct_of_limit > 95:
+                return {
+                    "name": "check_server_resources",
+                    "status": "critical",
+                    "severity": "high",
+                    "details": " | ".join(parts) + " — CPU hitting allocation limit!",
+                    "fix": None,
+                    "category": "resources",
+                }
+        # If unlimited, CPU >100% is normal multi-core usage — not a problem
 
         if mem_pct > 90:
             return {
@@ -751,7 +807,11 @@ class RustServerDiagnostics:
                 "category": "resources",
             }
 
-        if cpu > 80 or mem_pct > 80:
+        # Check if CPU is approaching its limit (only meaningful with a limit set)
+        cpu_warn = False
+        if cpu_limit and cpu_limit > 0:
+            cpu_warn = (cpu / cpu_limit) * 100 > 80
+        if cpu_warn or mem_pct > 80:
             return {
                 "name": "check_server_resources",
                 "status": "warning",
@@ -821,7 +881,9 @@ class RustServerDiagnostics:
                 plugin_count += 1
                 if "loaded" in line.lower():
                     loaded += 1
-                if "error" in line.lower() or "failed" in line.lower():
+                # Strip quoted plugin name to avoid false positives like "Nav Mesh Error Fix"
+                line_without_name = re.sub(r'"[^"]*"', '""', line)
+                if "error" in line_without_name.lower() or "failed" in line_without_name.lower():
                     errored += 1
 
         details = f"Oxide: {result.strip()}" if result else "Oxide detected"

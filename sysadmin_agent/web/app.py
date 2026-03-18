@@ -1558,7 +1558,18 @@ def handle_rust_connect_pterodactyl(data):
         if not resolved_id and len(servers) == 1:
             resolved_id = servers[0]["identifier"]
 
-        _ptero_connections[sid] = {"api": ptero, "server_id": resolved_id}
+        # Store server limits (CPU, memory) for diagnostics
+        server_limits = {}
+        for s in servers:
+            if s.get("identifier") == resolved_id:
+                server_limits = s.get("limits", {})
+                break
+
+        _ptero_connections[sid] = {
+            "api": ptero,
+            "server_id": resolved_id,
+            "limits": server_limits,
+        }
 
         result = {
             "servers": servers,
@@ -1673,8 +1684,10 @@ def handle_rust_run_diagnostics(data=None):
         def progress_cb(msg):
             emit("status", {"message": msg})
 
+        server_limits = ptero_data.get("limits", {}) if ptero_data else {}
         diag = RustServerDiagnostics(rcon, ptero=ptero, server_id=server_id,
-                                     ssh=ssh, on_progress=progress_cb)
+                                     ssh=ssh, on_progress=progress_cb,
+                                     server_limits=server_limits)
         results = diag.run_all()
 
         emit("rust_diagnostics_result", {"diagnostics": results})
@@ -1706,8 +1719,10 @@ def handle_rust_diagnose_lag(data=None):
         def progress_cb(msg):
             emit("status", {"message": msg})
 
+        server_limits = ptero_data.get("limits", {}) if ptero_data else {}
         diag = RustServerDiagnostics(rcon, ptero=ptero, server_id=server_id,
-                                     ssh=ssh, on_progress=progress_cb)
+                                     ssh=ssh, on_progress=progress_cb,
+                                     server_limits=server_limits)
         results = diag.run_lag_diagnosis()
 
         emit("rust_lag_result", {"diagnosis": results})
@@ -1739,7 +1754,9 @@ def handle_rust_plugin_action(data):
 
         ptero = ptero_data["api"] if ptero_data else None
         server_id = ptero_data.get("server_id") if ptero_data else None
-        diag = RustServerDiagnostics(rcon, ptero=ptero, server_id=server_id)
+        server_limits = ptero_data.get("limits", {}) if ptero_data else {}
+        diag = RustServerDiagnostics(rcon, ptero=ptero, server_id=server_id,
+                                     server_limits=server_limits)
 
         if action == "reload":
             result = diag.reload_plugin(plugin_name)
