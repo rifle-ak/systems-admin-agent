@@ -72,6 +72,10 @@ class SSHManager:
 
         try:
             self._client.connect(**connect_kwargs)
+            # Enable keepalive to prevent stale connections
+            transport = self._client.get_transport()
+            if transport:
+                transport.set_keepalive(30)  # Send keepalive every 30 seconds
         except Exception:
             self._client = None
             raise

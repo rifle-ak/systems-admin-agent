@@ -159,6 +159,8 @@ a:hover { text-decoration: underline; }
 }
 
 .token-usage svg { color: var(--text-dim); }
+.token-usage:hover { border-color: var(--accent); }
+.token-sep { opacity: 0.4; }
 
 /* ===== Flash Messages ===== */
 .flash-messages {
@@ -1060,7 +1062,11 @@ a:hover { text-decoration: underline; }
 
     .message { max-width: 95%; }
 
-    .token-usage .token-label { display: none; }
+    .token-usage .token-label,
+    .token-usage .token-sep,
+    .token-usage .token-monthly { display: none; }
+
+    .version-label { display: none; }
 
     .nav-title { font-size: 14px; }
 

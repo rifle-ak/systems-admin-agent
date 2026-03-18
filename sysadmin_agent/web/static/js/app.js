@@ -4,6 +4,7 @@
 let socket = null;
 let isConnected = false;
 let totalTokens = 0;
+let tokenBreakdown = null;
 let pendingApprovals = {};
 let profiles = [];
 let currentPlanEl = null;
@@ -173,15 +174,24 @@ function setConnectionStatus(state, text) {
     label.textContent = text || state.charAt(0).toUpperCase() + state.slice(1);
 }
 
-function updateTokenUsage(tokenData) {
+function updateTokenUsage(tokenData, breakdown) {
     if (!tokenData) return;
     // Backend sends {total_input_tokens, total_output_tokens, total_requests}
     const added = (tokenData.total_input_tokens || 0) + (tokenData.total_output_tokens || 0);
     if (added > 0) {
         totalTokens = added; // Use absolute total from backend, not cumulative
     }
+    if (breakdown) {
+        tokenBreakdown = breakdown;
+    }
     const el = $('.token-count');
     if (el) el.textContent = formatNumber(totalTokens);
+
+    // Update the monthly counter in nav if available
+    const monthEl = $('.token-monthly');
+    if (monthEl && breakdown && breakdown.monthly) {
+        monthEl.textContent = formatNumber(breakdown.monthly.total_tokens);
+    }
 }
 
 // ---------- Sidebar Toggle ----------
@@ -552,7 +562,7 @@ function onAgentPlan(data) {
 
     // Update token usage
     if (data.token_usage) {
-        updateTokenUsage(data.token_usage);
+        updateTokenUsage(data.token_usage, data.token_breakdown);
     }
 }
 
@@ -628,7 +638,7 @@ function onAgentDone(data) {
     currentPlanEl = null;
 
     if (data.token_usage) {
-        updateTokenUsage(data.token_usage);
+        updateTokenUsage(data.token_usage, data.token_breakdown);
     }
 
     addMessage('system', 'Agent finished.');
@@ -1223,6 +1233,174 @@ async function saveConfig(e) {
     }
 }
 
+// ---------- Upgrade ----------
+
+async function checkForUpdates() {
+    try {
+        const res = await fetch('/api/version');
+        if (!res.ok) return;
+        const data = await res.json();
+        const btn = $('#upgradeBtn');
+        const verEl = $('#currentVersion');
+
+        if (verEl) verEl.textContent = `v${data.current_version}`;
+
+        if (btn) {
+            if (data.update_available) {
+                btn.style.display = 'inline-flex';
+                btn.title = data.remote_version
+                    ? `Update to v${data.remote_version} (${data.commits_behind} commits behind)`
+                    : `${data.commits_behind} commits behind`;
+            } else {
+                btn.style.display = 'none';
+            }
+        }
+    } catch (e) {
+        console.error('Version check failed:', e);
+    }
+}
+
+async function doUpgrade() {
+    const btn = $('#upgradeBtn');
+    if (btn) {
+        btn.disabled = true;
+        btn.textContent = 'Updating...';
+    }
+
+    try {
+        const res = await fetch('/api/upgrade', { method: 'POST' });
+        const data = await res.json();
+
+        if (res.ok) {
+            const newVer = data.new_version ? ` to v${data.new_version}` : '';
+            showFlash(`Update complete${newVer}. Restarting...`, 'success');
+
+            // Auto-restart after a short delay
+            if (data.restart_required) {
+                setTimeout(async () => {
+                    try {
+                        await fetch('/api/restart', { method: 'POST' });
+                    } catch (e) {
+                        // Expected — server is restarting
+                    }
+                    // Wait and reload the page
+                    showFlash('Server restarting, page will reload in 5 seconds...', 'info');
+                    setTimeout(() => { window.location.reload(); }, 5000);
+                }, 1000);
+            }
+        } else {
+            showFlash('Update failed: ' + (data.message || 'Unknown error'), 'error');
+            if (btn) {
+                btn.disabled = false;
+                btn.textContent = 'Update';
+            }
+        }
+    } catch (e) {
+        showFlash('Update error: ' + e.message, 'error');
+        if (btn) {
+            btn.disabled = false;
+            btn.textContent = 'Update';
+        }
+    }
+}
+
+// ---------- Token Detail Popup ----------
+
+function showTokenDetails() {
+    // Fetch latest from API
+    fetch('/api/tokens')
+        .then(r => r.json())
+        .then(data => {
+            tokenBreakdown = data;
+            _renderTokenPopup(data);
+        })
+        .catch(() => {
+            if (tokenBreakdown) _renderTokenPopup(tokenBreakdown);
+        });
+}
+
+function _renderTokenPopup(data) {
+    const existing = document.getElementById('tokenDetailPopup');
+    if (existing) { existing.remove(); return; } // Toggle off
+
+    const overlay = document.createElement('div');
+    overlay.id = 'tokenDetailPopup';
+    overlay.style.cssText = 'position:fixed;top:0;left:0;right:0;bottom:0;z-index:10000;display:flex;align-items:flex-start;justify-content:flex-end;padding:56px 12px 0 0;';
+    overlay.onclick = (e) => { if (e.target === overlay) overlay.remove(); };
+
+    const s = data.session || {};
+    const d = data.daily || {};
+    const m = data.monthly || {};
+    const a = data.all_time || {};
+    const billingDay = data.billing_cycle_day || 1;
+
+    const popup = document.createElement('div');
+    popup.style.cssText = 'background:var(--bg-secondary,#1e1e2e);border:1px solid var(--border,#333);border-radius:12px;padding:16px;min-width:280px;color:var(--text-primary,#cdd6f4);box-shadow:0 8px 32px rgba(0,0,0,0.4);';
+    popup.innerHTML = `
+        <h3 style="margin:0 0 12px;font-size:14px;color:var(--text-secondary,#a6adc8);">Token Usage</h3>
+
+        <div style="margin-bottom:12px;">
+            <div style="font-size:11px;color:var(--text-dim,#6c7086);text-transform:uppercase;letter-spacing:0.5px;margin-bottom:4px;">This Session</div>
+            <div style="font-size:18px;font-weight:600;">${formatNumber(s.total_tokens || 0)}</div>
+            <div style="font-size:11px;color:var(--text-dim,#6c7086);">${formatNumber(s.input_tokens || 0)} in / ${formatNumber(s.output_tokens || 0)} out &middot; ${s.requests || 0} requests</div>
+        </div>
+
+        <div style="margin-bottom:12px;">
+            <div style="font-size:11px;color:var(--text-dim,#6c7086);text-transform:uppercase;letter-spacing:0.5px;margin-bottom:4px;">Today (${d.date || '-'})</div>
+            <div style="font-size:18px;font-weight:600;">${formatNumber(d.total_tokens || 0)}</div>
+            <div style="font-size:11px;color:var(--text-dim,#6c7086);">${formatNumber(d.input_tokens || 0)} in / ${formatNumber(d.output_tokens || 0)} out &middot; ${d.requests || 0} requests</div>
+        </div>
+
+        <div style="margin-bottom:12px;">
+            <div style="font-size:11px;color:var(--text-dim,#6c7086);text-transform:uppercase;letter-spacing:0.5px;margin-bottom:4px;">This Month (billing day: ${billingDay})</div>
+            <div style="font-size:18px;font-weight:600;color:var(--accent,#89b4fa);">${formatNumber(m.total_tokens || 0)}</div>
+            <div style="font-size:11px;color:var(--text-dim,#6c7086);">${formatNumber(m.input_tokens || 0)} in / ${formatNumber(m.output_tokens || 0)} out &middot; ${m.requests || 0} requests</div>
+        </div>
+
+        <div style="margin-bottom:12px;">
+            <div style="font-size:11px;color:var(--text-dim,#6c7086);text-transform:uppercase;letter-spacing:0.5px;margin-bottom:4px;">All Time</div>
+            <div style="font-size:14px;font-weight:500;">${formatNumber(a.total_tokens || 0)}</div>
+            <div style="font-size:11px;color:var(--text-dim,#6c7086);">${a.requests || 0} requests</div>
+        </div>
+
+        <div style="border-top:1px solid var(--border,#333);padding-top:8px;margin-top:8px;">
+            <label style="font-size:11px;color:var(--text-dim,#6c7086);display:flex;align-items:center;gap:6px;">
+                Billing cycle day:
+                <input type="number" id="billingCycleDay" value="${billingDay}" min="1" max="28"
+                    style="width:48px;background:var(--bg-primary,#11111b);border:1px solid var(--border,#333);border-radius:4px;color:var(--text-primary,#cdd6f4);padding:2px 6px;font-size:12px;">
+                <button class="btn btn-small btn-secondary" onclick="saveBillingCycle()" style="font-size:10px;padding:2px 8px;">Save</button>
+            </label>
+        </div>
+    `;
+
+    overlay.appendChild(popup);
+    document.body.appendChild(overlay);
+}
+
+async function saveBillingCycle() {
+    const input = document.getElementById('billingCycleDay');
+    if (!input) return;
+    const day = parseInt(input.value);
+    if (isNaN(day) || day < 1 || day > 28) {
+        showFlash('Billing cycle day must be 1-28', 'error');
+        return;
+    }
+    try {
+        await fetch('/api/tokens/billing-cycle', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ day }),
+        });
+        showFlash(`Billing cycle set to day ${day}`, 'success');
+        // Close and reopen to refresh
+        const popup = document.getElementById('tokenDetailPopup');
+        if (popup) popup.remove();
+        showTokenDetails();
+    } catch (e) {
+        showFlash('Failed to save billing cycle', 'error');
+    }
+}
+
 // ---------- Dashboard Init ----------
 
 function initDashboard() {
@@ -1230,6 +1408,22 @@ function initDashboard() {
     initSidebarToggle();
     initChatInput();
     loadProfiles();
+    checkForUpdates();
+    // Fetch initial token data
+    fetch('/api/tokens').then(r => r.json()).then(data => {
+        tokenBreakdown = data;
+        if (data.session) {
+            totalTokens = data.session.total_tokens || 0;
+            const el = $('.token-count');
+            if (el) el.textContent = formatNumber(totalTokens);
+        }
+        const monthEl = $('.token-monthly');
+        if (monthEl && data.monthly) {
+            monthEl.textContent = formatNumber(data.monthly.total_tokens);
+        }
+    }).catch(() => {});
+    // Check for updates periodically (every 30 minutes)
+    setInterval(checkForUpdates, 30 * 60 * 1000);
 }
 
 // ---------- Auto-init on page load ----------

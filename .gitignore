@@ -16,3 +16,5 @@ env/
 .vscode/
 *.swp
 *.swo
+ssh_keys/
+token_usage.json

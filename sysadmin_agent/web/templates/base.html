@@ -28,13 +28,26 @@
                 <span class="status-dot disconnected"></span>
                 <span class="status-text">Disconnected</span>
             </div>
-            <div class="token-usage" id="tokenUsage" title="API token usage">
+            <div class="token-usage" id="tokenUsage" title="Click for token details" onclick="showTokenDetails()" style="cursor:pointer;">
                 <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2">
                     <circle cx="12" cy="12" r="10"/>
                     <path d="M12 6v6l4 2"/>
                 </svg>
-                <span class="token-count">0</span> tokens
+                <span class="token-count">0</span>
+                <span class="token-label">session</span>
+                <span class="token-sep" style="color:var(--text-dim);margin:0 2px;">|</span>
+                <span class="token-monthly" style="color:var(--accent,#89b4fa);">0</span>
+                <span class="token-label">mo</span>
             </div>
+            <button class="btn btn-small btn-success" id="upgradeBtn" onclick="doUpgrade()" style="display:none;font-size:11px;padding:3px 10px;" title="Update available">
+                <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" style="margin-right:4px;">
+                    <path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4"/>
+                    <polyline points="7 10 12 15 17 10"/>
+                    <line x1="12" y1="15" x2="12" y2="3"/>
+                </svg>
+                Update
+            </button>
+            <span class="version-label" id="currentVersion" style="font-size:10px;color:var(--text-dim);"></span>
         </div>
     </nav>
 
