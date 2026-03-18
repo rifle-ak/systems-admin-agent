@@ -4,6 +4,7 @@ Flask + Flask-SocketIO web application for the systems admin agent.
 Provides a browser-based UI for connecting to servers, running diagnostics,
 chatting with the AI agent, and managing approval/rollback workflows.
 """
+from __future__ import annotations
 
 import json
 import logging
