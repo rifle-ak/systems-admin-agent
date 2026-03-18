@@ -562,6 +562,26 @@ a:hover { text-decoration: underline; }
     to { transform: rotate(360deg); }
 }
 
+/* Progress indicator with spinner */
+.progress-indicator {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    color: var(--text-secondary);
+    font-size: 0.9em;
+}
+
+.progress-spinner {
+    display: inline-block;
+    width: 14px;
+    height: 14px;
+    border: 2px solid var(--border);
+    border-top-color: var(--info);
+    border-radius: 50%;
+    animation: spin 0.6s linear infinite;
+    flex-shrink: 0;
+}
+
 .check-icon.pass { color: var(--success); }
 .check-icon.pass::after { content: '\2713'; font-weight: bold; }
 .check-icon.fail { color: var(--danger); }

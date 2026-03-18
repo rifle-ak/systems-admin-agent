@@ -527,8 +527,15 @@ def list_profiles():
     for name, prof in server_profiles.items():
         entry = dict(prof) if isinstance(prof, dict) else {}
         entry.setdefault("name", name)
-        # Remove the obfuscated password from the listing
+        # Remove obfuscated secrets from the listing
         entry.pop("password_obf", None)
+        entry.pop("rcon_password_obf", None)
+        entry.pop("ptero_api_key_obf", None)
+        # Tell the frontend which Rust fields are saved
+        if "rcon_password_obf" in prof:
+            entry["rcon_password_saved"] = True
+        if "ptero_api_key_obf" in prof:
+            entry["ptero_api_key_saved"] = True
         result.append(entry)
     return jsonify(result)
 
@@ -559,6 +566,20 @@ def save_profile():
         ).decode("ascii")
     elif data.get("auth_type") == "password":
         profile_data["password_required"] = True
+
+    # Handle Rust admin credentials (RCON + Pterodactyl)
+    import base64 as _b64
+    if data.get("rcon_password"):
+        profile_data["rcon_password_obf"] = _b64.b64encode(
+            data["rcon_password"].encode("utf-8")
+        ).decode("ascii")
+        profile_data.pop("rcon_password", None)
+
+    if data.get("ptero_api_key"):
+        profile_data["ptero_api_key_obf"] = _b64.b64encode(
+            data["ptero_api_key"].encode("utf-8")
+        ).decode("ascii")
+        profile_data.pop("ptero_api_key", None)
 
     server_profiles[name] = profile_data
     _save_config(server_profiles)
@@ -1376,6 +1397,15 @@ def handle_rust_connect_rcon(data):
     port = data.get("port", 28016)
     password = (data.get("password") or "").strip()
 
+    # Look up saved RCON password from profile if requested
+    if not password and data.get("use_saved_password"):
+        profile_name = data.get("profile_name", "")
+        profile = server_profiles.get(profile_name, {})
+        obf = profile.get("rcon_password_obf", "")
+        if obf:
+            import base64
+            password = base64.b64decode(obf).decode("utf-8")
+
     if not host or not password:
         emit("error", {"message": "RCON host and password are required."})
         return
@@ -1421,6 +1451,15 @@ def handle_rust_connect_pterodactyl(data):
     api_key = (data.get("api_key") or "").strip()
     server_id = (data.get("server_id") or "").strip()
 
+    # Look up saved API key from profile if requested
+    if not api_key and data.get("use_saved_key"):
+        profile_name = data.get("profile_name", "")
+        profile = server_profiles.get(profile_name, {})
+        obf = profile.get("ptero_api_key_obf", "")
+        if obf:
+            import base64
+            api_key = base64.b64decode(obf).decode("utf-8")
+
     if not base_url or not api_key:
         emit("error", {"message": "Panel URL and API key are required."})
         return
@@ -1449,10 +1488,19 @@ def handle_rust_connect_pterodactyl(data):
             resolved_id = servers[0]["identifier"]
 
         _ptero_connections[sid] = {"api": ptero, "server_id": resolved_id}
-        emit("rust_ptero_connected", {
+
+        result = {
             "servers": servers,
             "selected_server": resolved_id,
-        })
+            "client_api": ptero._client_api_available,
+        }
+        if not ptero._client_api_available:
+            result["warning"] = (
+                "Connected with Application API key (ptla_). "
+                "Server management (files, console, power) requires a "
+                "Client API key (ptlc_). Create one under Account > API Credentials."
+            )
+        emit("rust_ptero_connected", result)
     except Exception as exc:
         logger.exception("Pterodactyl connect failed")
         emit("error", {"message": f"Pterodactyl connection failed: {exc}"})
@@ -1550,7 +1598,12 @@ def handle_rust_run_diagnostics(data=None):
         from sysadmin_agent.rust.rust_diagnostics import RustServerDiagnostics
 
         emit("status", {"message": "Running Rust server diagnostics..."})
-        diag = RustServerDiagnostics(rcon, ptero=ptero, server_id=server_id, ssh=ssh)
+
+        def progress_cb(msg):
+            emit("status", {"message": msg})
+
+        diag = RustServerDiagnostics(rcon, ptero=ptero, server_id=server_id,
+                                     ssh=ssh, on_progress=progress_cb)
         results = diag.run_all()
 
         emit("rust_diagnostics_result", {"diagnostics": results})
@@ -1578,7 +1631,12 @@ def handle_rust_diagnose_lag(data=None):
         from sysadmin_agent.rust.rust_diagnostics import RustServerDiagnostics
 
         emit("status", {"message": "Diagnosing lag and rubber-banding..."})
-        diag = RustServerDiagnostics(rcon, ptero=ptero, server_id=server_id, ssh=ssh)
+
+        def progress_cb(msg):
+            emit("status", {"message": msg})
+
+        diag = RustServerDiagnostics(rcon, ptero=ptero, server_id=server_id,
+                                     ssh=ssh, on_progress=progress_cb)
         results = diag.run_lag_diagnosis()
 
         emit("rust_lag_result", {"diagnosis": results})
