@@ -319,6 +319,22 @@ def _build_server_context(sid: str) -> dict:
         ctx["architecture"] = os_info.get("architecture", "unknown")
         ctx["hostname"] = os_info.get("hostname", "unknown")
 
+    # CPU core count — important for interpreting %CPU values
+    cpu_cores = data.get("cpu_cores")
+    if not cpu_cores:
+        ssh = _get_ssh(sid)
+        if ssh:
+            try:
+                result = ssh.execute("nproc 2>/dev/null || grep -c ^processor /proc/cpuinfo")
+                cores = int(result["stdout"].strip())
+                if cores > 0:
+                    cpu_cores = cores
+                    data["cpu_cores"] = cores  # cache it
+            except Exception:
+                pass
+    if cpu_cores:
+        ctx["cpu_cores"] = cpu_cores
+
     apps = data.get("apps")
     if apps:
         web = [w.get("name", "") for w in apps.get("web_servers", [])]
@@ -1077,7 +1093,38 @@ def handle_ask_agent(data):
                     })
                     continue
 
-            if step.get("destructive"):
+            command_type = step.get("command_type", "ssh")
+
+            if command_type == "rcon":
+                # Execute via RCON WebSocket connection
+                rcon = _rcon_connections.get(sid)
+                if not rcon:
+                    emit("step_result", {
+                        "step": step["step"],
+                        "command": command,
+                        "skipped": True,
+                        "reason": "No RCON connection available",
+                    })
+                    continue
+                try:
+                    # Use longer timeout for heavy commands
+                    heavy = {"entity.count", "server.save", "status",
+                             "serverinfo", "perf"}
+                    cmd_base = command.split()[0] if command else ""
+                    timeout = 120 if cmd_base in heavy else 30
+                    rcon_result = rcon.command(command, timeout=timeout)
+                    result = {
+                        "stdout": rcon_result or "(no output)",
+                        "stderr": "",
+                        "exit_code": 0,
+                    }
+                except Exception as exc:
+                    result = {
+                        "stdout": "",
+                        "stderr": str(exc),
+                        "exit_code": 1,
+                    }
+            elif step.get("destructive"):
                 result = ssh.execute_sudo(command)
             else:
                 result = ssh.execute(command)
@@ -1094,6 +1141,7 @@ def handle_ask_agent(data):
             emit("step_result", {
                 "step": step["step"],
                 "command": command,
+                "command_type": command_type,
                 "exit_code": result["exit_code"],
                 "stdout": result["stdout"],
                 "stderr": result["stderr"],
