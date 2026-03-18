@@ -15,10 +15,12 @@ class AppDiscovery:
             "cms": self._discover_cms,
             "languages": self._discover_languages,
             "containers": self._discover_containers,
+            "game_servers": self._discover_game_servers,
         }
 
         results = {}
-        with ThreadPoolExecutor(max_workers=len(categories)) as executor:
+        # Limit concurrency to avoid overwhelming the SSH connection
+        with ThreadPoolExecutor(max_workers=3) as executor:
             futures = {
                 executor.submit(fn): name
                 for name, fn in categories.items()
@@ -273,3 +275,54 @@ class AppDiscovery:
             containers.append(podman_info)
 
         return containers
+
+    def _discover_game_servers(self):
+        servers = []
+
+        # Pterodactyl Panel
+        ptero_result = self._run(
+            "php /var/www/pterodactyl/artisan --version 2>/dev/null || "
+            "cat /var/www/pterodactyl/.env 2>/dev/null | grep APP_VERSION | head -1"
+        )
+        if ptero_result["exit_code"] == 0 and ptero_result["stdout"].strip():
+            version = ptero_result["stdout"].strip().splitlines()[0]
+            servers.append({"name": "Pterodactyl Panel", "version": version})
+
+        # Pterodactyl Wings
+        wings_result = self._run("wings --version 2>/dev/null || systemctl is-active wings 2>/dev/null")
+        if wings_result["exit_code"] == 0 and wings_result["stdout"].strip():
+            version = wings_result["stdout"].strip().splitlines()[0]
+            running = self._run("systemctl is-active wings 2>/dev/null")
+            servers.append({
+                "name": "Pterodactyl Wings",
+                "version": version,
+                "running": running["exit_code"] == 0,
+            })
+
+        # Rust Dedicated Server (via Pterodactyl or standalone)
+        rust_result = self._run(
+            "pgrep -a RustDedicated 2>/dev/null || "
+            "docker ps --format '{{.Names}}\\t{{.Image}}' 2>/dev/null | grep -i rust"
+        )
+        if rust_result["exit_code"] == 0 and rust_result["stdout"].strip():
+            servers.append({
+                "name": "Rust Dedicated Server",
+                "version": rust_result["stdout"].strip().splitlines()[0],
+                "running": True,
+            })
+
+        # Oxide/uMod
+        oxide_result = self._run(
+            "find /var/lib/pterodactyl/volumes -maxdepth 4 -name 'Oxide.Core.dll' -type f 2>/dev/null | head -1 || "
+            "find /home -maxdepth 5 -name 'Oxide.Core.dll' -type f 2>/dev/null | head -1",
+            timeout=15,
+        )
+        if oxide_result["exit_code"] == 0 and oxide_result["stdout"].strip():
+            oxide_path = oxide_result["stdout"].strip().splitlines()[0]
+            servers.append({
+                "name": "Oxide/uMod",
+                "path": oxide_path.rsplit("/", 1)[0],
+                "installed": True,
+            })
+
+        return servers
