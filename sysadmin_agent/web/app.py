@@ -1705,18 +1705,131 @@ def set_billing_cycle():
 
 
 # ---------------------------------------------------------------------------
-# Security: restrict to localhost by default
+# Security: rate limiting, scan protection, and access control
 # ---------------------------------------------------------------------------
 
+# Track failed/suspicious requests per IP for auto-blocking
+_ip_fail_counts: dict[str, list] = {}  # ip -> list of timestamps
+_ip_blocked: dict[str, float] = {}     # ip -> block_until timestamp
+_IP_FAIL_WINDOW = 60       # seconds to track failures
+_IP_FAIL_THRESHOLD = 15    # failures within window to trigger block
+_IP_BLOCK_DURATION = 600   # block for 10 minutes
+_ALLOWED_IPS: set[str] | None = None   # populated from WEB_ALLOWED_IPS env
+
+
+def _get_allowed_ips() -> set[str] | None:
+    """Parse WEB_ALLOWED_IPS env var (comma-separated) into a set."""
+    global _ALLOWED_IPS
+    if _ALLOWED_IPS is not None:
+        return _ALLOWED_IPS
+    raw = os.environ.get("WEB_ALLOWED_IPS", "").strip()
+    if raw:
+        _ALLOWED_IPS = {ip.strip() for ip in raw.split(",") if ip.strip()}
+    else:
+        _ALLOWED_IPS = set()
+    return _ALLOWED_IPS
+
+
+def _record_suspicious(ip: str):
+    """Record a suspicious request from an IP.  Auto-blocks after threshold."""
+    import time as _time
+    now = _time.time()
+    if ip not in _ip_fail_counts:
+        _ip_fail_counts[ip] = []
+    _ip_fail_counts[ip].append(now)
+    # Prune old entries
+    _ip_fail_counts[ip] = [t for t in _ip_fail_counts[ip] if now - t < _IP_FAIL_WINDOW]
+    if len(_ip_fail_counts[ip]) >= _IP_FAIL_THRESHOLD:
+        _ip_blocked[ip] = now + _IP_BLOCK_DURATION
+        _ip_fail_counts.pop(ip, None)
+        logger.warning("Auto-blocked IP %s for %d seconds (scan/abuse detected)", ip, _IP_BLOCK_DURATION)
+
+
 @app.before_request
-def _restrict_remote():
-    """Block non-local requests unless WEB_ALLOW_REMOTE is set."""
-    if os.environ.get("WEB_ALLOW_REMOTE", "").lower() in ("1", "true", "yes"):
-        return None
+def _security_gate():
+    """Multi-layer security: localhost-only, IP allowlist, auto-block scanners."""
+    import time as _time
     remote = request.remote_addr
-    if remote not in ("127.0.0.1", "::1", "localhost"):
-        return "Forbidden: remote access is disabled. Set WEB_ALLOW_REMOTE=1 to allow.", 403
+    is_local = remote in ("127.0.0.1", "::1", "localhost")
+
+    # Always allow localhost
+    if is_local:
+        return None
+
+    # Check if remote access is enabled
+    if os.environ.get("WEB_ALLOW_REMOTE", "").lower() not in ("1", "true", "yes"):
+        return "", 403
+
+    # Check IP allowlist (if configured, only those IPs can access)
+    allowed = _get_allowed_ips()
+    if allowed and remote not in allowed:
+        return "", 403
+
+    # Check auto-block list
+    block_until = _ip_blocked.get(remote, 0)
+    if block_until > _time.time():
+        return "", 403
+    elif block_until:
+        # Block expired, clean up
+        _ip_blocked.pop(remote, None)
+
     return None
+
+
+@app.after_request
+def _track_bad_requests(response):
+    """Track 400 errors to detect scanners and auto-block them."""
+    if response.status_code == 400:
+        remote = request.remote_addr
+        if remote not in ("127.0.0.1", "::1", "localhost"):
+            _record_suspicious(remote)
+    return response
+
+
+# ---------------------------------------------------------------------------
+# HTTP Routes — Security management
+# ---------------------------------------------------------------------------
+
+@app.route("/api/security/blocked-ips", methods=["GET"])
+@_require_auth
+def get_blocked_ips():
+    """List currently blocked IPs."""
+    import time as _time
+    now = _time.time()
+    blocked = {
+        ip: {"blocked_until": ts, "remaining_seconds": int(ts - now)}
+        for ip, ts in _ip_blocked.items()
+        if ts > now
+    }
+    return jsonify({"blocked_ips": blocked, "count": len(blocked)})
+
+
+@app.route("/api/security/block-ip", methods=["POST"])
+@_require_auth
+def block_ip():
+    """Manually block an IP address."""
+    import time as _time
+    data = request.get_json(force=True)
+    ip = (data.get("ip") or "").strip()
+    duration = int(data.get("duration", 3600))  # default 1 hour
+    if not ip:
+        return jsonify({"error": "IP address required"}), 400
+    _ip_blocked[ip] = _time.time() + duration
+    logger.info("Manually blocked IP %s for %d seconds", ip, duration)
+    return jsonify({"status": "ok", "ip": ip, "duration": duration})
+
+
+@app.route("/api/security/unblock-ip", methods=["POST"])
+@_require_auth
+def unblock_ip():
+    """Unblock an IP address."""
+    data = request.get_json(force=True)
+    ip = (data.get("ip") or "").strip()
+    if not ip:
+        return jsonify({"error": "IP address required"}), 400
+    _ip_blocked.pop(ip, None)
+    _ip_fail_counts.pop(ip, None)
+    return jsonify({"status": "ok", "ip": ip})
 
 
 # ---------------------------------------------------------------------------
