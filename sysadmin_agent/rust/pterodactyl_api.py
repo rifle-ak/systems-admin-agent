@@ -374,27 +374,62 @@ class PterodactylAPI:
         return ""
 
     def rust_list_oxide_plugins(self, server_id) -> list:
-        """List Oxide plugin files on disk."""
-        try:
-            files = self.list_files(server_id, "/server/rust/oxide/plugins")
-            return [f for f in files if f["is_file"] and f["name"].endswith(".cs")]
-        except PterodactylAPIError:
-            return []
+        """List Oxide plugin files on disk.
+
+        Tries multiple path casings since Oxide installations vary.
+        """
+        plugin_paths = [
+            "/server/rust/oxide/plugins",
+            "/server/rust/Oxide/Plugins",
+            "/server/rust/Oxide/plugins",
+            "/server/rust/oxide/Plugins",
+        ]
+        for path in plugin_paths:
+            try:
+                files = self.list_files(server_id, path)
+                plugins = [f for f in files if f["is_file"] and f["name"].endswith(".cs")]
+                if plugins:
+                    return plugins
+            except PterodactylAPIError:
+                continue
+        return []
 
     def rust_get_oxide_config(self, server_id, plugin_name) -> str:
         """Read an Oxide plugin config file."""
-        path = f"/server/rust/oxide/config/{plugin_name}.json"
-        try:
-            return self.get_file_contents(server_id, path)
-        except PterodactylAPIError:
-            return ""
+        config_paths = [
+            f"/server/rust/oxide/config/{plugin_name}.json",
+            f"/server/rust/Oxide/Config/{plugin_name}.json",
+            f"/server/rust/Oxide/config/{plugin_name}.json",
+        ]
+        for path in config_paths:
+            try:
+                content = self.get_file_contents(server_id, path)
+                if content:
+                    return content
+            except PterodactylAPIError:
+                continue
+        return ""
 
     def rust_write_oxide_config(self, server_id, plugin_name, config) -> dict:
         """Write an Oxide plugin config file."""
-        path = f"/server/rust/oxide/config/{plugin_name}.json"
+        # Try to find the existing config path first
+        config_paths = [
+            f"/server/rust/oxide/config/{plugin_name}.json",
+            f"/server/rust/Oxide/Config/{plugin_name}.json",
+            f"/server/rust/Oxide/config/{plugin_name}.json",
+        ]
+        write_path = config_paths[0]  # default
+        for path in config_paths:
+            try:
+                existing = self.get_file_contents(server_id, path)
+                if existing:
+                    write_path = path
+                    break
+            except PterodactylAPIError:
+                continue
         if isinstance(config, dict):
             config = json.dumps(config, indent=2)
-        return self.write_file(server_id, path, config)
+        return self.write_file(server_id, write_path, config)
 
     def rust_get_oxide_logs(self, server_id, limit=50) -> list:
         """List recent Oxide log files.

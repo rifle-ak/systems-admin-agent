@@ -34,6 +34,14 @@ class RustServerDiagnostics:
         results = diag.run_all()
     """
 
+    # All known Oxide directory casing variations
+    _OXIDE_LOG_DIRS = [
+        "/server/rust/oxide/logs",
+        "/server/rust/Oxide/Logs",
+        "/server/rust/Oxide/logs",
+        "/server/rust/oxide/Logs",
+    ]
+
     def __init__(self, rcon=None, ptero=None, server_id=None, ssh=None,
                  on_progress=None, server_limits=None):
         self.rcon = rcon
@@ -43,6 +51,8 @@ class RustServerDiagnostics:
         self._on_progress = on_progress  # callback(message_str)
         # Server limits from Pterodactyl (cpu: 0=unlimited, memory in MB, etc.)
         self._server_limits = server_limits or {}
+        # Discovered Oxide log directory (cached after first successful read)
+        self._oxide_log_dir = None
 
         self._checks = [
             self.check_server_fps,
@@ -616,6 +626,119 @@ class RustServerDiagnostics:
         return None
 
     # ------------------------------------------------------------------
+    # Log reading helpers (with path discovery and caching)
+    # ------------------------------------------------------------------
+
+    def _discover_oxide_log_dir(self):
+        """Find the actual Oxide log directory by trying all casing variants.
+
+        Caches the result so subsequent reads don't repeat the discovery.
+        """
+        if self._oxide_log_dir:
+            return self._oxide_log_dir
+        if not self.ptero or not self.server_id:
+            return None
+        for path in self._OXIDE_LOG_DIRS:
+            try:
+                files = self.ptero.list_files(self.server_id, path)
+                if files:
+                    self._oxide_log_dir = path
+                    return path
+            except Exception:
+                continue
+        return None
+
+    def _read_oxide_log(self, filename):
+        """Read an Oxide log file, trying all known directory casings.
+
+        Uses the cached log directory if already discovered.
+        """
+        if not self.ptero or not self.server_id:
+            return None
+
+        # Try cached path first
+        if self._oxide_log_dir:
+            try:
+                content = self.ptero.get_file_contents(
+                    self.server_id,
+                    f"{self._oxide_log_dir}/{filename}"
+                )
+                if content:
+                    return content
+            except Exception:
+                pass
+
+        # Fall through to trying all paths
+        for log_dir in self._OXIDE_LOG_DIRS:
+            try:
+                content = self.ptero.get_file_contents(
+                    self.server_id,
+                    f"{log_dir}/{filename}"
+                )
+                if content:
+                    self._oxide_log_dir = log_dir  # cache it
+                    return content
+            except Exception:
+                continue
+        return None
+
+    def _read_steam_logs(self, max_files=5):
+        """Read Steam log files, trying both directory casings.
+
+        Returns list of (filename, content) tuples.
+        """
+        if not self.ptero or not self.server_id:
+            return []
+
+        steam_dirs = ["/server/rust/Steam/logs", "/server/rust/steam/logs"]
+        for steam_dir in steam_dirs:
+            try:
+                files = self.ptero.list_files(self.server_id, steam_dir)
+                logs = sorted(
+                    [f for f in files if f["is_file"]],
+                    key=lambda f: f.get("modified_at", ""),
+                    reverse=True,
+                )
+                results = []
+                for sf in logs[:max_files]:
+                    try:
+                        content = self.ptero.get_file_contents(
+                            self.server_id, f"{steam_dir}/{sf['name']}"
+                        )
+                        if content:
+                            results.append((sf["name"], content))
+                    except Exception:
+                        continue
+                if results:
+                    return results
+            except Exception:
+                continue
+        return []
+
+    def _read_console_logs(self):
+        """Read server console output logs.
+
+        Returns list of (filename, content) tuples.
+        """
+        if not self.ptero or not self.server_id:
+            return []
+
+        console_paths = [
+            "/server/rust/RustDedicated_Data/output_log.txt",
+            "/server/rust/output_log.txt",
+            "/server/rust/server_console.log",
+        ]
+        results = []
+        for path in console_paths:
+            try:
+                content = self.ptero.get_file_contents(self.server_id, path)
+                if content:
+                    results.append((path.split("/")[-1], content))
+            except Exception:
+                continue
+        return results
+
+    # ------------------------------------------------------------------
     # Individual diagnostic checks
     # ------------------------------------------------------------------
 
@@ -935,12 +1058,16 @@ class RustServerDiagnostics:
         return self._ok("check_oxide_health", details, "plugins")
 
     def check_plugin_errors(self):
-        """Check for plugin errors in recent logs."""
+        """Check for plugin errors in Oxide logs.
+
+        Scans up to 10 most recent log files (entire content, not just tail)
+        to catch errors across the full uptime period.
+        """
         if not self.ptero or not self.server_id:
             return None
 
         try:
-            log_files = self.ptero.rust_get_oxide_logs(self.server_id, limit=3)
+            log_files = self.ptero.rust_get_oxide_logs(self.server_id, limit=15)
             if not log_files:
                 return {
                     "name": "check_plugin_errors",
@@ -952,44 +1079,49 @@ class RustServerDiagnostics:
                 }
 
             errors = []
-            # Determine which log path actually worked by trying variations
-            log_dir_paths = [
-                "/server/rust/oxide/logs",
-                "/server/rust/Oxide/Logs",
-                "/server/rust/Oxide/logs",
-                "/server/rust/oxide/Logs",
-            ]
-            for log_file in log_files[:2]:  # Check last 2 logs
-                content = None
-                for log_dir in log_dir_paths:
-                    try:
-                        content = self.ptero.get_file_contents(
-                            self.server_id,
-                            f"{log_dir}/{log_file['name']}"
-                        )
-                        if content:
-                            break
-                    except Exception:
-                        continue
-                if content:
-                    for line in content.splitlines()[-100:]:  # Last 100 lines
-                        if any(kw in line.lower() for kw in ("error", "exception", "nullref", "failed to")):
-                            errors.append(line.strip()[:200])
+            files_scanned = 0
+            total_lines = 0
+            for log_file in log_files[:10]:  # Scan last 10 log files
+                content = self._read_oxide_log(log_file["name"])
+                if not content:
+                    continue
+                files_scanned += 1
+                lines = content.splitlines()
+                total_lines += len(lines)
+                for line in lines:
+                    if any(kw in line.lower() for kw in
+                           ("error", "exception", "nullref", "failed to",
+                            "unloaded", "compilation failed")):
+                        errors.append({
+                            "file": log_file["name"],
+                            "line": line.strip()[:200],
+                        })
+
+            scan_info = f"Scanned {files_scanned} log file(s), {total_lines:,} lines"
 
             if errors:
-                unique_errors = list(set(errors))[:10]
+                # Deduplicate by line content, keep source info
+                seen = {}
+                for e in errors:
+                    key = e["line"]
+                    if key not in seen:
+                        seen[key] = e
+                unique_errors = list(seen.values())
                 return {
                     "name": "check_plugin_errors",
                     "status": "warning",
-                    "severity": "medium",
-                    "details": f"Found {len(errors)} error(s) in recent Oxide logs:\n" +
-                               "\n".join(f"  - {e}" for e in unique_errors[:5]),
+                    "severity": "high" if len(unique_errors) > 20 else "medium",
+                    "details": f"{scan_info}. Found {len(errors)} error(s) "
+                               f"({len(unique_errors)} unique):\n" +
+                               "\n".join(f"  - [{e['file']}] {e['line']}"
+                                         for e in unique_errors[:10]),
                     "fix": [
                         {"command_rcon": "oxide.plugins", "description": "Check plugin status", "destructive": False},
                     ],
                     "category": "plugins",
                 }
-            return self._ok("check_plugin_errors", "No errors in recent Oxide logs", "plugins")
+            return self._ok("check_plugin_errors",
+                             f"No errors in Oxide logs ({scan_info})", "plugins")
 
         except Exception as e:
             return {
@@ -1360,100 +1492,94 @@ class RustServerDiagnostics:
     def check_recent_crashes(self):
         """Check for recent crash logs.
 
-        Checks both crash files on disk and Oxide/Steam logs for crash
-        indicators like segfaults, OOM kills, and unhandled exceptions.
+        Scans crash files on disk, Oxide logs (up to 10 files, full content),
+        Steam logs, and console output for crash indicators.
         """
         if not self.ptero or not self.server_id:
             return None
 
         crash_indicators = []
+        sources_checked = []
 
+        crash_keywords = ("crash", "segfault", "oom", "out of memory",
+                          "fatal", "unhandled exception", "stack overflow",
+                          "access violation", "killed", "terminated",
+                          "aborted", "sigsegv", "sigkill")
+
+        # 1. Check for crash files in /server/rust
         try:
-            # Check for crash files in /server/rust
             files = self.ptero.list_files(self.server_id, "/server/rust")
             crash_files = [
                 f for f in files
-                if f["is_file"] and ("crash" in f["name"].lower() or "error" in f["name"].lower())
+                if f["is_file"] and ("crash" in f["name"].lower() or
+                                     "error" in f["name"].lower() or
+                                     "dump" in f["name"].lower())
             ]
-
             if crash_files:
+                sources_checked.append("crash files")
                 recent = sorted(crash_files, key=lambda f: f.get("modified_at", ""), reverse=True)
                 for cf in recent[:5]:
                     crash_indicators.append(f"File: {cf['name']} ({cf.get('modified_at', 'unknown')})")
         except Exception:
             pass
 
-        # Check Oxide logs for crash-related entries
+        # 2. Scan Oxide logs — full content, up to 10 files
         try:
-            log_files = self.ptero.rust_get_oxide_logs(self.server_id, limit=2)
-            crash_keywords = ("crash", "segfault", "oom", "out of memory",
-                              "fatal", "unhandled exception", "stack overflow",
-                              "access violation")
-            log_dir_paths = [
-                "/server/rust/oxide/logs",
-                "/server/rust/Oxide/Logs",
-                "/server/rust/Oxide/logs",
-                "/server/rust/oxide/Logs",
-            ]
-            for log_file in log_files[:2]:
-                for log_dir in log_dir_paths:
-                    try:
-                        content = self.ptero.get_file_contents(
-                            self.server_id,
-                            f"{log_dir}/{log_file['name']}"
-                        )
-                        if content:
-                            for line in content.splitlines()[-200:]:
-                                if any(kw in line.lower() for kw in crash_keywords):
-                                    crash_indicators.append(f"Log: {line.strip()[:150]}")
-                            break
-                    except Exception:
-                        continue
+            log_files = self.ptero.rust_get_oxide_logs(self.server_id, limit=15)
+            if log_files:
+                sources_checked.append(f"{min(len(log_files), 10)} Oxide log files")
+                for log_file in log_files[:10]:
+                    content = self._read_oxide_log(log_file["name"])
+                    if content:
+                        for line in content.splitlines():
+                            if any(kw in line.lower() for kw in crash_keywords):
+                                crash_indicators.append(
+                                    f"Oxide/{log_file['name']}: {line.strip()[:150]}")
         except Exception:
             pass
 
-        # Check Steam logs for crash indicators
+        # 3. Scan Steam logs — full content, up to 5 files
         try:
-            steam_log_dirs = ["/server/rust/Steam/logs", "/server/rust/steam/logs"]
-            for steam_dir in steam_log_dirs:
-                try:
-                    steam_files = self.ptero.list_files(self.server_id, steam_dir)
-                    steam_logs = sorted(
-                        [f for f in steam_files if f["is_file"]],
-                        key=lambda f: f.get("modified_at", ""),
-                        reverse=True,
-                    )
-                    for sf in steam_logs[:2]:
-                        try:
-                            content = self.ptero.get_file_contents(
-                                self.server_id, f"{steam_dir}/{sf['name']}"
-                            )
-                            if content:
-                                for line in content.splitlines()[-100:]:
-                                    if any(kw in line.lower() for kw in ("crash", "fatal", "segfault")):
-                                        crash_indicators.append(f"Steam: {line.strip()[:150]}")
-                        except Exception:
-                            continue
-                    if steam_logs:
-                        break
-                except Exception:
-                    continue
+            steam_results = self._read_steam_logs(max_files=5)
+            if steam_results:
+                sources_checked.append(f"{len(steam_results)} Steam log files")
+                for fname, content in steam_results:
+                    for line in content.splitlines():
+                        if any(kw in line.lower() for kw in crash_keywords):
+                            crash_indicators.append(
+                                f"Steam/{fname}: {line.strip()[:150]}")
         except Exception:
             pass
+
+        # 4. Scan console output logs
+        try:
+            console_results = self._read_console_logs()
+            if console_results:
+                sources_checked.append("console output")
+                for fname, content in console_results:
+                    for line in content.splitlines():
+                        if any(kw in line.lower() for kw in crash_keywords):
+                            crash_indicators.append(
+                                f"{fname}: {line.strip()[:150]}")
+        except Exception:
+            pass
+
+        scan_info = f"Checked: {', '.join(sources_checked)}" if sources_checked else "No log sources accessible"
 
         if crash_indicators:
-            unique = list(dict.fromkeys(crash_indicators))[:10]
+            unique = list(dict.fromkeys(crash_indicators))[:15]
             return {
                 "name": "check_recent_crashes",
                 "status": "warning",
-                "severity": "medium",
-                "details": f"Found {len(unique)} crash indicator(s):\n" +
-                           "\n".join(f"  - {c}" for c in unique[:8]),
+                "severity": "high" if len(unique) > 5 else "medium",
+                "details": f"{scan_info}. Found {len(unique)} crash indicator(s):\n" +
+                           "\n".join(f"  - {c}" for c in unique[:10]),
                 "fix": None,
                 "category": "stability",
             }
 
-        return self._ok("check_recent_crashes", "No crash files or crash indicators in logs", "stability")
+        return self._ok("check_recent_crashes",
+                         f"No crash indicators found ({scan_info})", "stability")
 
     def check_connection_quality(self):
         """Check server network stats."""
@@ -1521,128 +1647,127 @@ class RustServerDiagnostics:
             return None
 
     def check_server_logs(self):
-        """Scan all available server logs for issues.
+        """Comprehensive scan of ALL available server logs.
 
-        Checks Oxide logs, Steam logs, and the Pterodactyl console output
-        for errors, warnings, performance issues, and crash indicators.
-        Returns a consolidated view of problems found across all log sources.
+        Reads full content (not just tail) of up to 10 Oxide log files,
+        5 Steam log files, and console output. Reports scan coverage
+        so the user knows exactly what was checked.
         """
         if not self.ptero or not self.server_id:
             return None
 
         issues = []
         sources_checked = []
+        total_lines = 0
+        total_files = 0
 
         # Keywords that indicate real problems (not just informational)
         error_keywords = (
             "error", "exception", "nullref", "failed to", "crash",
             "fatal", "stack overflow", "out of memory", "oom",
             "timeout", "timed out", "access violation", "segfault",
+            "compilation failed", "unloaded",
         )
         warning_keywords = (
-            "warning", "deprecated", "slow", "lag", "high ping",
+            "warning", "deprecated", "slow", "lag",
             "took too long", "performance",
         )
 
-        # 1. Check Oxide logs
+        # 1. Scan Oxide logs — full content, up to 10 files
         try:
-            log_files = self.ptero.rust_get_oxide_logs(self.server_id, limit=3)
+            log_files = self.ptero.rust_get_oxide_logs(self.server_id, limit=15)
             if log_files:
-                sources_checked.append("Oxide logs")
-                log_dir_paths = [
-                    "/server/rust/oxide/logs",
-                    "/server/rust/Oxide/Logs",
-                    "/server/rust/Oxide/logs",
-                    "/server/rust/oxide/Logs",
-                ]
-                for log_file in log_files[:3]:
-                    for log_dir in log_dir_paths:
-                        try:
-                            content = self.ptero.get_file_contents(
-                                self.server_id,
-                                f"{log_dir}/{log_file['name']}"
-                            )
-                            if content:
-                                for line in content.splitlines()[-200:]:
-                                    ll = line.lower()
-                                    if any(kw in ll for kw in error_keywords):
-                                        issues.append({
-                                            "source": f"Oxide/{log_file['name']}",
-                                            "level": "error",
-                                            "line": line.strip()[:200],
-                                        })
-                                    elif any(kw in ll for kw in warning_keywords):
-                                        issues.append({
-                                            "source": f"Oxide/{log_file['name']}",
-                                            "level": "warning",
-                                            "line": line.strip()[:200],
-                                        })
-                                break
-                        except Exception:
-                            continue
-        except Exception:
-            pass
-
-        # 2. Check Steam logs
-        steam_log_dirs = ["/server/rust/Steam/logs", "/server/rust/steam/logs"]
-        for steam_dir in steam_log_dirs:
-            try:
-                steam_files = self.ptero.list_files(self.server_id, steam_dir)
-                steam_logs = sorted(
-                    [f for f in steam_files if f["is_file"]],
-                    key=lambda f: f.get("modified_at", ""),
-                    reverse=True,
-                )
-                if steam_logs:
-                    sources_checked.append("Steam logs")
-                    for sf in steam_logs[:2]:
-                        try:
-                            content = self.ptero.get_file_contents(
-                                self.server_id, f"{steam_dir}/{sf['name']}"
-                            )
-                            if content:
-                                for line in content.splitlines()[-100:]:
-                                    ll = line.lower()
-                                    if any(kw in ll for kw in error_keywords):
-                                        issues.append({
-                                            "source": f"Steam/{sf['name']}",
-                                            "level": "error",
-                                            "line": line.strip()[:200],
-                                        })
-                        except Exception:
-                            continue
-                    break  # Found a valid steam log dir
-            except Exception:
-                continue
-
-        # 3. Check Pterodactyl console output (via server log file if available)
-        console_log_dirs = [
-            "/server/rust/server_console.log",
-            "/server/rust/output_log.txt",
-            "/server/rust/RustDedicated_Data/output_log.txt",
-        ]
-        for log_path in console_log_dirs:
-            try:
-                content = self.ptero.get_file_contents(self.server_id, log_path)
-                if content:
-                    sources_checked.append(log_path.split("/")[-1])
-                    for line in content.splitlines()[-200:]:
+                oxide_files_read = 0
+                for log_file in log_files[:10]:
+                    content = self._read_oxide_log(log_file["name"])
+                    if not content:
+                        continue
+                    oxide_files_read += 1
+                    total_files += 1
+                    lines = content.splitlines()
+                    total_lines += len(lines)
+                    for line in lines:
                         ll = line.lower()
                         if any(kw in ll for kw in error_keywords):
                             issues.append({
-                                "source": log_path.split("/")[-1],
+                                "source": f"Oxide/{log_file['name']}",
                                 "level": "error",
                                 "line": line.strip()[:200],
                             })
-            except Exception:
-                continue
+                        elif any(kw in ll for kw in warning_keywords):
+                            issues.append({
+                                "source": f"Oxide/{log_file['name']}",
+                                "level": "warning",
+                                "line": line.strip()[:200],
+                            })
+                if oxide_files_read:
+                    sources_checked.append(
+                        f"{oxide_files_read} Oxide log file(s)"
+                        f" of {len(log_files)} available"
+                    )
+        except Exception:
+            pass
+
+        # 2. Scan Steam logs — full content, up to 5 files
+        try:
+            steam_results = self._read_steam_logs(max_files=5)
+            if steam_results:
+                sources_checked.append(f"{len(steam_results)} Steam log file(s)")
+                for fname, content in steam_results:
+                    total_files += 1
+                    lines = content.splitlines()
+                    total_lines += len(lines)
+                    for line in lines:
+                        ll = line.lower()
+                        if any(kw in ll for kw in error_keywords):
+                            issues.append({
+                                "source": f"Steam/{fname}",
+                                "level": "error",
+                                "line": line.strip()[:200],
+                            })
+        except Exception:
+            pass
+
+        # 3. Scan console output logs — full content
+        try:
+            console_results = self._read_console_logs()
+            if console_results:
+                for fname, content in console_results:
+                    sources_checked.append(fname)
+                    total_files += 1
+                    lines = content.splitlines()
+                    total_lines += len(lines)
+                    for line in lines:
+                        ll = line.lower()
+                        if any(kw in ll for kw in error_keywords):
+                            issues.append({
+                                "source": fname,
+                                "level": "error",
+                                "line": line.strip()[:200],
+                            })
+                        elif any(kw in ll for kw in warning_keywords):
+                            issues.append({
+                                "source": fname,
+                                "level": "warning",
+                                "line": line.strip()[:200],
+                            })
+        except Exception:
+            pass
+
+        scan_summary = (
+            f"Scanned {total_files} file(s), {total_lines:,} total lines "
+            f"({', '.join(sources_checked)})"
+            if sources_checked else
+            "Could not access any log files"
+        )
 
         if not sources_checked:
             return {
                 "name": "check_server_logs",
                 "status": "info",
                 "severity": "low",
-                "details": "Could not access any log files. Checked Oxide, Steam, and console logs.",
+                "details": f"{scan_summary}. Checked Oxide, Steam, and console log paths "
+                           "(all case variations).",
                 "fix": None,
                 "category": "logs",
             }
@@ -1651,38 +1776,42 @@ class RustServerDiagnostics:
         warnings = [i for i in issues if i["level"] == "warning"]
 
         if errors:
-            # Deduplicate by taking unique lines
-            unique_errors = list({i["line"]: i for i in errors}.values())[:10]
+            # Deduplicate by line content, keep source info
+            unique_errors = list({i["line"]: i for i in errors}.values())
             details = (
-                f"Scanned {', '.join(sources_checked)}. "
-                f"Found {len(errors)} error(s), {len(warnings)} warning(s).\n"
-                f"Recent errors:\n"
+                f"{scan_summary}.\n"
+                f"Found {len(errors)} error(s) ({len(unique_errors)} unique), "
+                f"{len(warnings)} warning(s).\n"
+                f"Errors:\n"
             )
-            for e in unique_errors[:8]:
+            for e in unique_errors[:12]:
                 details += f"  [{e['source']}] {e['line']}\n"
+            if len(unique_errors) > 12:
+                details += f"  ... and {len(unique_errors) - 12} more unique errors\n"
             return {
                 "name": "check_server_logs",
                 "status": "warning",
-                "severity": "medium" if len(errors) < 10 else "high",
+                "severity": "high" if len(unique_errors) > 20 else "medium",
                 "details": details.strip(),
                 "fix": None,
                 "category": "logs",
             }
 
         if warnings:
+            unique_warnings = list({i["line"]: i for i in warnings}.values())
             return {
                 "name": "check_server_logs",
                 "status": "info",
                 "severity": "low",
-                "details": f"Scanned {', '.join(sources_checked)}. "
-                           f"No errors found, {len(warnings)} warning(s).",
+                "details": f"{scan_summary}. No errors, "
+                           f"{len(warnings)} warning(s) ({len(unique_warnings)} unique).",
                 "fix": None,
                 "category": "logs",
             }
 
         return self._ok(
             "check_server_logs",
-            f"Scanned {', '.join(sources_checked)} — no issues found",
+            f"No issues found. {scan_summary}.",
             "logs",
         )
 
