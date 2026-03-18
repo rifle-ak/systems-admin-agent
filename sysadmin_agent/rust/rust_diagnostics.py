@@ -1792,10 +1792,13 @@ class RustServerDiagnostics:
             return None
 
     def _discover_all_log_sources(self):
-        """Scan the container file system for ALL log directories and files.
+        """Scan the container file system for additional log sources.
 
         Walks the top two directory levels looking for directories named
-        'logs', 'log', or files ending in .log/.txt that look like logs.
+        'logs' or 'log', or files ending in .log/.txt that look like server logs.
+        Excludes known non-server directories (command_history, backups, etc.)
+        and sources already covered by the Oxide/Steam/console scanners.
+
         Returns a list of (display_name, full_path, is_dir) tuples.
         """
         if not self.ptero or not self.server_id:
@@ -1806,6 +1809,15 @@ class RustServerDiagnostics:
 
         search_roots = ["/", "/server/rust", "/home/container", "/server"]
         log_dir_names = {"logs", "log"}
+
+        # Directories to skip — either our own app data or already covered
+        skip_dirs = {
+            "command_history", "backups", "backup", "cache", ".cache",
+            "node_modules", "__pycache__", ".git", "tmp", "temp",
+            "blueprints", "saves", "cfg", "config",
+        }
+        # Directory names already scanned by phases 1-3
+        already_covered_dirs = {"oxide", "steam"}
 
         for root in search_roots:
             try:
@@ -1823,14 +1835,20 @@ class RustServerDiagnostics:
                 seen_paths.add(full_path)
 
                 if entry["is_file"]:
-                    # Log-like files at the root level
-                    if (name_lower.endswith(".log") or
-                        name_lower.endswith(".txt") and
+                    # Only match files that are clearly server log files
+                    # Fix precedence: parenthesise the OR conditions
+                    if (name_lower.endswith(".log") and
+                        name_lower not in ("latest.log",)) or \
+                       (name_lower.endswith(".txt") and
                         ("log" in name_lower or "crash" in name_lower or
-                         "error" in name_lower or "output" in name_lower)):
+                         "error" in name_lower or "output" in name_lower) and
+                        name_lower not in ("output_log.txt",)):
                         sources.append((name, full_path, False))
                 else:
-                    # Check if this is a logs directory
+                    # Skip app-internal and already-covered directories
+                    if name_lower in skip_dirs or name_lower in already_covered_dirs:
+                        continue
+
                     if name_lower in log_dir_names:
                         sources.append((f"{root}/{name}", full_path, True))
                     else:
@@ -1840,19 +1858,24 @@ class RustServerDiagnostics:
                                 self.server_id, full_path)
                             for sub in sub_entries:
                                 sub_name = sub["name"]
-                                sub_lower = sub["name"].lower()
+                                sub_lower = sub_name.lower()
                                 sub_path = f"{full_path}/{sub_name}"
                                 if sub_path in seen_paths:
                                     continue
                                 seen_paths.add(sub_path)
 
+                                if sub_lower in skip_dirs or sub_lower in already_covered_dirs:
+                                    continue
+
                                 if not sub["is_file"] and sub_lower in log_dir_names:
                                     sources.append((
                                         f"{name}/{sub_name}", sub_path, True))
                                 elif sub["is_file"] and (
-                                    sub_lower.endswith(".log") or
+                                    (sub_lower.endswith(".log") and
+                                     sub_lower != "latest.log") or
                                     (sub_lower.endswith(".txt") and
-                                     "log" in sub_lower)):
+                                     "log" in sub_lower and
+                                     sub_lower != "output_log.txt")):
                                     sources.append((
                                         f"{name}/{sub_name}", sub_path, False))
                         except Exception:
@@ -1995,21 +2018,11 @@ class RustServerDiagnostics:
             pass
 
         # 4. Broad discovery — find any log dirs/files we missed above
+        # Build a set of paths already scanned to avoid duplicates
         try:
             all_sources = self._discover_all_log_sources()
-            already_scanned = set()
-            for src_name in sources_checked:
-                already_scanned.add(src_name.lower())
 
             for display_name, full_path, is_dir in all_sources:
-                # Skip sources we already scanned
-                if any(s.lower() in display_name.lower() for s in
-                       ("oxide", "steam", "output_log", "server_console",
-                        "Log.EAC", "latest.log")):
-                    # Already covered by sections 1-3
-                    if any(display_name.lower() in s.lower()
-                           for s in sources_checked):
-                        continue
 
                 if is_dir:
                     # Read files from this log directory

@@ -192,8 +192,11 @@ class RCONClient:
         return self.command("fps")
 
     def entity_count(self) -> str:
-        """Get total entity count."""
-        return self.command("entity.count")
+        """Get total entity count.
+
+        This is a heavy command on large servers — use a longer timeout.
+        """
+        return self.command("entity.count", timeout=120)
 
     def player_list(self) -> str:
         """Get connected player list with details."""
@@ -204,8 +207,12 @@ class RCONClient:
         return self.command("server.save")
 
     def gc_collect(self) -> str:
-        """Force garbage collection."""
-        return self.command("gc.collect")
+        """Force garbage collection.
+
+        The server usually returns no text, so we return a confirmation.
+        """
+        result = self.command("gc.collect")
+        return result if result and result.strip() else "GC triggered successfully."
 
     def oxide_plugins(self) -> str:
         """List all Oxide/uMod plugins."""
@@ -242,8 +249,21 @@ class RCONClient:
         return self.command("env.time")
 
     def performance_report(self) -> str:
-        """Get perf command output (performance counters)."""
-        return self.command("perf")
+        """Get performance report.
+
+        'perf' alone may just show the toggle state (global.perf: "0").
+        Use 'perf 6' to get the last 6 seconds of performance data,
+        which works even when global.perf is disabled.
+        """
+        result = self.command("perf 6", timeout=60)
+        if result and "global.perf" not in result:
+            return result
+        # Fallback: try enabling perf, get data, then disable
+        self.command("perf 1")
+        import time
+        time.sleep(2)
+        result = self.command("perf 0")
+        return result if result else "No performance data available."
 
     def pool_status(self) -> str:
         """Get object pool status (memory management)."""
