@@ -33,6 +33,7 @@ from flask_socketio import SocketIO, emit
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 ENV_PATH = PROJECT_ROOT / ".env"
 CONFIG_PATH = PROJECT_ROOT / "config.json"
+TOKEN_USAGE_PATH = PROJECT_ROOT / "token_usage.json"
 
 # ---------------------------------------------------------------------------
 # .env loading (manual, no hard dependency on python-dotenv)
@@ -93,6 +94,13 @@ app.secret_key = os.environ.get("SECRET_KEY") or secrets.token_hex(32)
 socketio = SocketIO(app, cors_allowed_origins="*", async_mode="threading")
 
 logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Persistent token usage tracker
+# ---------------------------------------------------------------------------
+from sysadmin_agent.web.token_tracker import TokenTracker
+
+_token_tracker = TokenTracker(storage_path=str(TOKEN_USAGE_PATH))
 
 # ---------------------------------------------------------------------------
 # In-memory session stores (keyed by Flask session id)
@@ -276,10 +284,20 @@ def _get_conversation(sid: str) -> list:
 
 
 def _get_brain(sid: str):
-    """Return a session-persistent AgentBrain so token usage accumulates."""
+    """Return a session-persistent AgentBrain so token usage accumulates.
+    Also hooks into the global persistent token tracker."""
     if sid not in _brains:
         mods = _import_agent_modules()
-        _brains[sid] = mods["AgentBrain"]()
+        brain = mods["AgentBrain"]()
+        # Wrap _track_usage to also feed the global persistent tracker
+        original_track = brain._track_usage
+
+        def _wrapped_track(usage):
+            original_track(usage)
+            _token_tracker.add_usage(usage.input_tokens, usage.output_tokens)
+
+        brain._track_usage = _wrapped_track
+        _brains[sid] = brain
     return _brains[sid]
 
 
@@ -910,7 +928,11 @@ def handle_ask_agent(data):
         # Store assistant reply in conversation
         conversation.append({"role": "assistant", "content": json.dumps(plan)})
 
-        emit("agent_plan", {"plan": plan, "token_usage": brain.get_token_usage()})
+        emit("agent_plan", {
+            "plan": plan,
+            "token_usage": brain.get_token_usage(),
+            "token_breakdown": _token_tracker.get_usage(),
+        })
 
         # If the brain asked questions instead of providing a plan, stop here
         if plan.get("questions"):
@@ -979,7 +1001,10 @@ def handle_ask_agent(data):
                 "analysis": analysis,
             })
 
-        emit("agent_done", {"token_usage": brain.get_token_usage()})
+        emit("agent_done", {
+            "token_usage": brain.get_token_usage(),
+            "token_breakdown": _token_tracker.get_usage(),
+        })
 
     except Exception as exc:
         logger.exception("ask_agent failed")
@@ -1147,6 +1172,185 @@ def handle_exec_command(data):
     except Exception as exc:
         logger.exception("exec_command failed")
         emit("error", {"message": f"Command execution failed: {exc}"})
+
+
+# ---------------------------------------------------------------------------
+# HTTP Routes — Upgrade
+# ---------------------------------------------------------------------------
+
+@app.route("/api/version", methods=["GET"])
+@_require_auth
+def get_version():
+    """Return current version and check if updates are available."""
+    from sysadmin_agent import __version__
+
+    result = {
+        "current_version": __version__,
+        "update_available": False,
+        "remote_version": None,
+    }
+
+    # Check for updates via git
+    try:
+        # Fetch latest from remote without merging
+        subprocess.run(
+            ["git", "fetch", "origin"],
+            cwd=str(PROJECT_ROOT),
+            capture_output=True,
+            timeout=15,
+        )
+
+        # Compare local HEAD with remote
+        local = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=str(PROJECT_ROOT),
+            capture_output=True, text=True, timeout=5,
+        ).stdout.strip()
+
+        # Get the default branch name
+        default_branch = subprocess.run(
+            ["git", "symbolic-ref", "refs/remotes/origin/HEAD"],
+            cwd=str(PROJECT_ROOT),
+            capture_output=True, text=True, timeout=5,
+        ).stdout.strip().replace("refs/remotes/origin/", "")
+        if not default_branch:
+            default_branch = "main"
+
+        remote = subprocess.run(
+            ["git", "rev-parse", f"origin/{default_branch}"],
+            cwd=str(PROJECT_ROOT),
+            capture_output=True, text=True, timeout=5,
+        ).stdout.strip()
+
+        if local != remote and remote:
+            result["update_available"] = True
+
+            # Try to get version from remote
+            remote_ver = subprocess.run(
+                ["git", "show", f"origin/{default_branch}:sysadmin_agent/__init__.py"],
+                cwd=str(PROJECT_ROOT),
+                capture_output=True, text=True, timeout=5,
+            ).stdout
+            for line in remote_ver.splitlines():
+                if "__version__" in line:
+                    result["remote_version"] = line.split("=")[1].strip().strip("\"'")
+                    break
+
+        # Count commits behind
+        behind = subprocess.run(
+            ["git", "rev-list", "--count", f"HEAD..origin/{default_branch}"],
+            cwd=str(PROJECT_ROOT),
+            capture_output=True, text=True, timeout=5,
+        ).stdout.strip()
+        result["commits_behind"] = int(behind) if behind.isdigit() else 0
+
+    except Exception as exc:
+        logger.warning("Version check failed: %s", exc)
+
+    return jsonify(result)
+
+
+@app.route("/api/upgrade", methods=["POST"])
+@_require_auth
+def do_upgrade():
+    """Pull latest changes from git and signal that a restart is needed."""
+    try:
+        # Get current branch
+        branch_result = subprocess.run(
+            ["git", "branch", "--show-current"],
+            cwd=str(PROJECT_ROOT),
+            capture_output=True, text=True, timeout=5,
+        )
+        current_branch = branch_result.stdout.strip() or "main"
+
+        # Stash any local changes
+        subprocess.run(
+            ["git", "stash"],
+            cwd=str(PROJECT_ROOT),
+            capture_output=True, timeout=10,
+        )
+
+        # Pull latest
+        pull_result = subprocess.run(
+            ["git", "pull", "origin", current_branch],
+            cwd=str(PROJECT_ROOT),
+            capture_output=True, text=True, timeout=60,
+        )
+
+        if pull_result.returncode != 0:
+            return jsonify({
+                "status": "error",
+                "message": f"Git pull failed: {pull_result.stderr}",
+            }), 500
+
+        # Install any new/updated dependencies
+        pip_result = subprocess.run(
+            [sys.executable, "-m", "pip", "install", "--user", "-e", "."],
+            cwd=str(PROJECT_ROOT),
+            capture_output=True, text=True, timeout=120,
+        )
+
+        # Get new version
+        new_version = None
+        try:
+            init_file = PROJECT_ROOT / "sysadmin_agent" / "__init__.py"
+            for line in init_file.read_text().splitlines():
+                if "__version__" in line:
+                    new_version = line.split("=")[1].strip().strip("\"'")
+                    break
+        except Exception:
+            pass
+
+        return jsonify({
+            "status": "ok",
+            "message": "Update complete. Please restart the application.",
+            "git_output": pull_result.stdout,
+            "new_version": new_version,
+            "restart_required": True,
+        })
+
+    except Exception as exc:
+        logger.exception("Upgrade failed")
+        return jsonify({"status": "error", "message": str(exc)}), 500
+
+
+@app.route("/api/restart", methods=["POST"])
+@_require_auth
+def do_restart():
+    """Restart the application process."""
+    def _restart():
+        import time as _time
+        _time.sleep(1)
+        os.execv(sys.executable, [sys.executable] + sys.argv)
+
+    # Run restart in background so we can send the response first
+    threading.Thread(target=_restart, daemon=True).start()
+    return jsonify({"status": "ok", "message": "Restarting..."})
+
+
+# ---------------------------------------------------------------------------
+# HTTP Routes — Token usage
+# ---------------------------------------------------------------------------
+
+@app.route("/api/tokens", methods=["GET"])
+@_require_auth
+def get_token_usage():
+    """Return full token usage breakdown."""
+    return jsonify(_token_tracker.get_usage())
+
+
+@app.route("/api/tokens/billing-cycle", methods=["POST"])
+@_require_auth
+def set_billing_cycle():
+    """Set the billing cycle day (1-28)."""
+    data = request.get_json(force=True)
+    day = data.get("day", 1)
+    try:
+        day = int(day)
+    except (ValueError, TypeError):
+        return jsonify({"error": "Invalid day"}), 400
+    _token_tracker.set_billing_cycle_day(day)
+    return jsonify({"status": "ok", "billing_cycle_day": day})
 
 
 # ---------------------------------------------------------------------------
