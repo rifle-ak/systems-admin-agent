@@ -63,6 +63,8 @@ class RustServerDiagnostics:
             self.check_recent_crashes,
             self.check_connection_quality,
             self.check_memory_leak_indicators,
+            self.check_hook_performance,
+            self.check_server_logs,
         ]
 
     def _progress(self, message):
@@ -109,13 +111,13 @@ class RustServerDiagnostics:
     def run_lag_diagnosis(self) -> dict:
         """Deep lag / rubber-banding diagnosis.
 
-        Runs 10 checks, cross-correlates findings, and returns a structured
+        Runs 11 checks, cross-correlates findings, and returns a structured
         analysis with root cause identification and actionable fixes.
         """
         findings = []
         raw = {}  # collected raw data for cross-correlation
 
-        total_steps = 10
+        total_steps = 11
 
         # 1. Tick rate — the single most direct indicator
         self._progress(f"[1/{total_steps}] Checking server tick rate (FPS)...")
@@ -504,8 +506,21 @@ class RustServerDiagnostics:
             except Exception:
                 pass
 
-        # 10. Cross-correlate and build root cause analysis
-        self._progress(f"[10/{total_steps}] Analyzing root cause...")
+        # 10. Scan all server logs for errors/issues
+        self._progress(f"[10/{total_steps}] Scanning server logs (Oxide, Steam, console)...")
+        log_result = self.check_server_logs()
+        if log_result and log_result.get("status") in ("warning", "critical"):
+            findings.append({
+                "cause": "Errors found in server logs",
+                "severity": "medium" if log_result.get("severity") == "medium" else "high",
+                "details": log_result.get("details", "Log errors detected"),
+                "likely_reason": "Plugin errors, server instability, or configuration issues",
+                "fix": "Review the errors above. Plugin errors often indicate outdated or "
+                       "incompatible plugins. Repeated errors can cause performance degradation.",
+            })
+
+        # 11. Cross-correlate and build root cause analysis
+        self._progress(f"[11/{total_steps}] Analyzing root cause...")
         root_cause = self._identify_root_cause(raw, findings)
         if root_cause:
             findings.insert(0, root_cause)
@@ -886,8 +901,23 @@ class RustServerDiagnostics:
                 if "error" in line_without_name.lower() or "failed" in line_without_name.lower():
                     errored += 1
 
+        # Cross-reference with Pterodactyl file listing for accurate count
+        disk_plugin_count = 0
+        if self.ptero and self.server_id:
+            try:
+                disk_plugins = self.ptero.rust_list_oxide_plugins(self.server_id)
+                disk_plugin_count = len(disk_plugins)
+            except Exception:
+                pass
+
+        # Use the higher of RCON-reported or disk count for accuracy
+        effective_count = max(loaded, plugin_count, disk_plugin_count)
+
         details = f"Oxide: {result.strip()}" if result else "Oxide detected"
-        details += f" | Plugins: {loaded} loaded"
+        if disk_plugin_count and disk_plugin_count != loaded:
+            details += f" | Plugins: {disk_plugin_count} on disk, {loaded} reported loaded by RCON"
+        else:
+            details += f" | Plugins: {effective_count} loaded"
         if errored:
             details += f", {errored} with errors"
             return {
@@ -912,20 +942,39 @@ class RustServerDiagnostics:
         try:
             log_files = self.ptero.rust_get_oxide_logs(self.server_id, limit=3)
             if not log_files:
-                return self._ok("check_plugin_errors", "No Oxide log files found", "plugins")
+                return {
+                    "name": "check_plugin_errors",
+                    "status": "info",
+                    "severity": "low",
+                    "details": "No Oxide log files found. Checked oxide/logs and Oxide/Logs paths.",
+                    "fix": None,
+                    "category": "plugins",
+                }
 
             errors = []
+            # Determine which log path actually worked by trying variations
+            log_dir_paths = [
+                "/server/rust/oxide/logs",
+                "/server/rust/Oxide/Logs",
+                "/server/rust/Oxide/logs",
+                "/server/rust/oxide/Logs",
+            ]
             for log_file in log_files[:2]:  # Check last 2 logs
-                try:
-                    content = self.ptero.get_file_contents(
-                        self.server_id,
-                        f"/server/rust/oxide/logs/{log_file['name']}"
-                    )
+                content = None
+                for log_dir in log_dir_paths:
+                    try:
+                        content = self.ptero.get_file_contents(
+                            self.server_id,
+                            f"{log_dir}/{log_file['name']}"
+                        )
+                        if content:
+                            break
+                    except Exception:
+                        continue
+                if content:
                     for line in content.splitlines()[-100:]:  # Last 100 lines
                         if any(kw in line.lower() for kw in ("error", "exception", "nullref", "failed to")):
                             errors.append(line.strip()[:200])
-                except Exception:
-                    continue
 
             if errors:
                 unique_errors = list(set(errors))[:10]
@@ -1142,52 +1191,106 @@ class RustServerDiagnostics:
             return None
 
     def check_process_health(self):
-        """Check the RustDedicated process via SSH."""
-        if not self.ssh:
-            return None
+        """Check the RustDedicated process health.
 
-        try:
-            result = self.ssh.execute(
-                "ps aux | grep -i '[R]ustDedicated' | head -5"
-            )
-            if not result["stdout"].strip():
+        Tries SSH first, but on Pterodactyl/Docker setups the process runs
+        inside a container where host-level ``ps`` can't see real stats.
+        Falls back to Pterodactyl API resource data when SSH returns 0.0%
+        or finds no process.
+        """
+        ssh_ok = False
+        if self.ssh:
+            try:
+                result = self.ssh.execute(
+                    "ps aux | grep -i '[R]ustDedicated' | head -5"
+                )
+                if result["stdout"].strip():
+                    lines = result["stdout"].strip().splitlines()
+                    for line in lines:
+                        parts = line.split()
+                        if len(parts) >= 4:
+                            cpu = float(parts[2])
+                            mem = float(parts[3])
+                            # If both are 0.0%, we're likely looking at a
+                            # containerised process — fall through to Ptero API
+                            if cpu == 0.0 and mem == 0.0:
+                                break
+                            ssh_ok = True
+                            details = f"RustDedicated — CPU: {cpu}%, MEM: {mem}%"
+                            if cpu > 150:  # multi-core
+                                return {
+                                    "name": "check_process_health",
+                                    "status": "warning",
+                                    "severity": "medium",
+                                    "details": details + " — heavy CPU usage",
+                                    "fix": None,
+                                    "category": "process",
+                                }
+                            return self._ok("check_process_health", details, "process")
+            except Exception:
+                pass
+
+        # Fall back to Pterodactyl API resource data (works inside containers)
+        if not ssh_ok and self.ptero and self.server_id:
+            try:
+                resources = self.ptero.get_resources(self.server_id)
+                res = resources.get("resources", {})
+                state = resources.get("current_state", "unknown")
+                cpu = res.get("cpu_absolute", 0)
+                mem_bytes = res.get("memory_bytes", 0)
+                mem_limit = res.get("memory_limit_bytes", 0)
+                mem_mb = mem_bytes // (1024 * 1024)
+                mem_limit_mb = mem_limit // (1024 * 1024) if mem_limit else 0
+                mem_pct = (mem_bytes / mem_limit * 100) if mem_limit else 0
+
+                if state != "running":
+                    return {
+                        "name": "check_process_health",
+                        "status": "critical",
+                        "severity": "high",
+                        "details": f"Server state: {state} — process is not running!",
+                        "fix": None,
+                        "category": "process",
+                    }
+
+                details = (
+                    f"RustDedicated (via Pterodactyl) — CPU: {cpu:.1f}%, "
+                    f"MEM: {mem_mb}MB"
+                )
+                if mem_limit_mb:
+                    details += f" / {mem_limit_mb}MB ({mem_pct:.1f}%)"
+
+                if cpu > 150:
+                    return {
+                        "name": "check_process_health",
+                        "status": "warning",
+                        "severity": "medium",
+                        "details": details + " — heavy CPU usage",
+                        "fix": None,
+                        "category": "process",
+                    }
+                return self._ok("check_process_health", details, "process")
+            except Exception as e:
                 return {
                     "name": "check_process_health",
-                    "status": "critical",
-                    "severity": "high",
-                    "details": "No RustDedicated process found! Server may be down.",
+                    "status": "error",
+                    "severity": "low",
+                    "details": f"Process check failed: {e}",
                     "fix": None,
                     "category": "process",
                 }
 
-            lines = result["stdout"].strip().splitlines()
-            for line in lines:
-                parts = line.split()
-                if len(parts) >= 4:
-                    cpu = float(parts[2])
-                    mem = float(parts[3])
-                    details = f"RustDedicated — CPU: {cpu}%, MEM: {mem}%"
-                    if cpu > 150:  # multi-core
-                        return {
-                            "name": "check_process_health",
-                            "status": "warning",
-                            "severity": "medium",
-                            "details": details + " — heavy CPU usage",
-                            "fix": None,
-                            "category": "process",
-                        }
-                    return self._ok("check_process_health", details, "process")
+        if not self.ssh and not (self.ptero and self.server_id):
+            return None
 
-            return self._ok("check_process_health", "RustDedicated process running", "process")
-        except Exception as e:
-            return {
-                "name": "check_process_health",
-                "status": "error",
-                "severity": "low",
-                "details": f"Process check failed: {e}",
-                "fix": None,
-                "category": "process",
-            }
+        return {
+            "name": "check_process_health",
+            "status": "critical",
+            "severity": "high",
+            "details": "No RustDedicated process found! Server may be down.",
+            "fix": None,
+            "category": "process",
+        }
 
     def check_disk_space_game(self):
         """Check disk space on the game server directory."""
@@ -1255,11 +1358,18 @@ class RustServerDiagnostics:
         return self._ok("check_oxide_update_status", f"Oxide: {result.strip()}", "updates")
 
     def check_recent_crashes(self):
-        """Check for recent crash logs."""
+        """Check for recent crash logs.
+
+        Checks both crash files on disk and Oxide/Steam logs for crash
+        indicators like segfaults, OOM kills, and unhandled exceptions.
+        """
         if not self.ptero or not self.server_id:
             return None
 
+        crash_indicators = []
+
         try:
+            # Check for crash files in /server/rust
             files = self.ptero.list_files(self.server_id, "/server/rust")
             crash_files = [
                 f for f in files
@@ -1268,22 +1378,82 @@ class RustServerDiagnostics:
 
             if crash_files:
                 recent = sorted(crash_files, key=lambda f: f.get("modified_at", ""), reverse=True)
-                details = f"Found {len(crash_files)} crash/error file(s):\n"
                 for cf in recent[:5]:
-                    details += f"  - {cf['name']} ({cf.get('modified_at', 'unknown')})\n"
-                return {
-                    "name": "check_recent_crashes",
-                    "status": "warning",
-                    "severity": "medium",
-                    "details": details.strip(),
-                    "fix": None,
-                    "category": "stability",
-                }
-
-            return self._ok("check_recent_crashes", "No crash files found", "stability")
-
+                    crash_indicators.append(f"File: {cf['name']} ({cf.get('modified_at', 'unknown')})")
         except Exception:
-            return None
+            pass
+
+        # Check Oxide logs for crash-related entries
+        try:
+            log_files = self.ptero.rust_get_oxide_logs(self.server_id, limit=2)
+            crash_keywords = ("crash", "segfault", "oom", "out of memory",
+                              "fatal", "unhandled exception", "stack overflow",
+                              "access violation")
+            log_dir_paths = [
+                "/server/rust/oxide/logs",
+                "/server/rust/Oxide/Logs",
+                "/server/rust/Oxide/logs",
+                "/server/rust/oxide/Logs",
+            ]
+            for log_file in log_files[:2]:
+                for log_dir in log_dir_paths:
+                    try:
+                        content = self.ptero.get_file_contents(
+                            self.server_id,
+                            f"{log_dir}/{log_file['name']}"
+                        )
+                        if content:
+                            for line in content.splitlines()[-200:]:
+                                if any(kw in line.lower() for kw in crash_keywords):
+                                    crash_indicators.append(f"Log: {line.strip()[:150]}")
+                            break
+                    except Exception:
+                        continue
+        except Exception:
+            pass
+
+        # Check Steam logs for crash indicators
+        try:
+            steam_log_dirs = ["/server/rust/Steam/logs", "/server/rust/steam/logs"]
+            for steam_dir in steam_log_dirs:
+                try:
+                    steam_files = self.ptero.list_files(self.server_id, steam_dir)
+                    steam_logs = sorted(
+                        [f for f in steam_files if f["is_file"]],
+                        key=lambda f: f.get("modified_at", ""),
+                        reverse=True,
+                    )
+                    for sf in steam_logs[:2]:
+                        try:
+                            content = self.ptero.get_file_contents(
+                                self.server_id, f"{steam_dir}/{sf['name']}"
+                            )
+                            if content:
+                                for line in content.splitlines()[-100:]:
+                                    if any(kw in line.lower() for kw in ("crash", "fatal", "segfault")):
+                                        crash_indicators.append(f"Steam: {line.strip()[:150]}")
+                        except Exception:
+                            continue
+                    if steam_logs:
+                        break
+                except Exception:
+                    continue
+        except Exception:
+            pass
+
+        if crash_indicators:
+            unique = list(dict.fromkeys(crash_indicators))[:10]
+            return {
+                "name": "check_recent_crashes",
+                "status": "warning",
+                "severity": "medium",
+                "details": f"Found {len(unique)} crash indicator(s):\n" +
+                           "\n".join(f"  - {c}" for c in unique[:8]),
+                "fix": None,
+                "category": "stability",
+            }
+
+        return self._ok("check_recent_crashes", "No crash files or crash indicators in logs", "stability")
 
     def check_connection_quality(self):
         """Check server network stats."""
@@ -1349,6 +1519,242 @@ class RustServerDiagnostics:
 
         except Exception:
             return None
+
+    def check_server_logs(self):
+        """Scan all available server logs for issues.
+
+        Checks Oxide logs, Steam logs, and the Pterodactyl console output
+        for errors, warnings, performance issues, and crash indicators.
+        Returns a consolidated view of problems found across all log sources.
+        """
+        if not self.ptero or not self.server_id:
+            return None
+
+        issues = []
+        sources_checked = []
+
+        # Keywords that indicate real problems (not just informational)
+        error_keywords = (
+            "error", "exception", "nullref", "failed to", "crash",
+            "fatal", "stack overflow", "out of memory", "oom",
+            "timeout", "timed out", "access violation", "segfault",
+        )
+        warning_keywords = (
+            "warning", "deprecated", "slow", "lag", "high ping",
+            "took too long", "performance",
+        )
+
+        # 1. Check Oxide logs
+        try:
+            log_files = self.ptero.rust_get_oxide_logs(self.server_id, limit=3)
+            if log_files:
+                sources_checked.append("Oxide logs")
+                log_dir_paths = [
+                    "/server/rust/oxide/logs",
+                    "/server/rust/Oxide/Logs",
+                    "/server/rust/Oxide/logs",
+                    "/server/rust/oxide/Logs",
+                ]
+                for log_file in log_files[:3]:
+                    for log_dir in log_dir_paths:
+                        try:
+                            content = self.ptero.get_file_contents(
+                                self.server_id,
+                                f"{log_dir}/{log_file['name']}"
+                            )
+                            if content:
+                                for line in content.splitlines()[-200:]:
+                                    ll = line.lower()
+                                    if any(kw in ll for kw in error_keywords):
+                                        issues.append({
+                                            "source": f"Oxide/{log_file['name']}",
+                                            "level": "error",
+                                            "line": line.strip()[:200],
+                                        })
+                                    elif any(kw in ll for kw in warning_keywords):
+                                        issues.append({
+                                            "source": f"Oxide/{log_file['name']}",
+                                            "level": "warning",
+                                            "line": line.strip()[:200],
+                                        })
+                                break
+                        except Exception:
+                            continue
+        except Exception:
+            pass
+
+        # 2. Check Steam logs
+        steam_log_dirs = ["/server/rust/Steam/logs", "/server/rust/steam/logs"]
+        for steam_dir in steam_log_dirs:
+            try:
+                steam_files = self.ptero.list_files(self.server_id, steam_dir)
+                steam_logs = sorted(
+                    [f for f in steam_files if f["is_file"]],
+                    key=lambda f: f.get("modified_at", ""),
+                    reverse=True,
+                )
+                if steam_logs:
+                    sources_checked.append("Steam logs")
+                    for sf in steam_logs[:2]:
+                        try:
+                            content = self.ptero.get_file_contents(
+                                self.server_id, f"{steam_dir}/{sf['name']}"
+                            )
+                            if content:
+                                for line in content.splitlines()[-100:]:
+                                    ll = line.lower()
+                                    if any(kw in ll for kw in error_keywords):
+                                        issues.append({
+                                            "source": f"Steam/{sf['name']}",
+                                            "level": "error",
+                                            "line": line.strip()[:200],
+                                        })
+                        except Exception:
+                            continue
+                    break  # Found a valid steam log dir
+            except Exception:
+                continue
+
+        # 3. Check Pterodactyl console output (via server log file if available)
+        console_log_dirs = [
+            "/server/rust/server_console.log",
+            "/server/rust/output_log.txt",
+            "/server/rust/RustDedicated_Data/output_log.txt",
+        ]
+        for log_path in console_log_dirs:
+            try:
+                content = self.ptero.get_file_contents(self.server_id, log_path)
+                if content:
+                    sources_checked.append(log_path.split("/")[-1])
+                    for line in content.splitlines()[-200:]:
+                        ll = line.lower()
+                        if any(kw in ll for kw in error_keywords):
+                            issues.append({
+                                "source": log_path.split("/")[-1],
+                                "level": "error",
+                                "line": line.strip()[:200],
+                            })
+            except Exception:
+                continue
+
+        if not sources_checked:
+            return {
+                "name": "check_server_logs",
+                "status": "info",
+                "severity": "low",
+                "details": "Could not access any log files. Checked Oxide, Steam, and console logs.",
+                "fix": None,
+                "category": "logs",
+            }
+
+        errors = [i for i in issues if i["level"] == "error"]
+        warnings = [i for i in issues if i["level"] == "warning"]
+
+        if errors:
+            # Deduplicate by taking unique lines
+            unique_errors = list({i["line"]: i for i in errors}.values())[:10]
+            details = (
+                f"Scanned {', '.join(sources_checked)}. "
+                f"Found {len(errors)} error(s), {len(warnings)} warning(s).\n"
+                f"Recent errors:\n"
+            )
+            for e in unique_errors[:8]:
+                details += f"  [{e['source']}] {e['line']}\n"
+            return {
+                "name": "check_server_logs",
+                "status": "warning",
+                "severity": "medium" if len(errors) < 10 else "high",
+                "details": details.strip(),
+                "fix": None,
+                "category": "logs",
+            }
+
+        if warnings:
+            return {
+                "name": "check_server_logs",
+                "status": "info",
+                "severity": "low",
+                "details": f"Scanned {', '.join(sources_checked)}. "
+                           f"No errors found, {len(warnings)} warning(s).",
+                "fix": None,
+                "category": "logs",
+            }
+
+        return self._ok(
+            "check_server_logs",
+            f"Scanned {', '.join(sources_checked)} — no issues found",
+            "logs",
+        )
+
+    def check_hook_performance(self):
+        """Profile plugin hook execution times via RCON perf command.
+
+        Enables level-6 profiling, waits briefly for data to accumulate,
+        then reads and parses the results to identify slow hooks.
+        """
+        if not self.rcon:
+            return None
+
+        try:
+            # Enable detailed profiling
+            self._safe_rcon("perf 6")
+            time.sleep(3)  # Let profiling data accumulate
+            perf_result = self._safe_rcon("perf 0")  # Disable and read results
+            if not perf_result:
+                return self._ok("check_hook_performance", "No perf data returned", "performance")
+
+            slow_hooks = self._parse_perf_hooks(perf_result)
+            if slow_hooks:
+                total_ms = sum(h["time"] for h in slow_hooks)
+                hook_list = "\n".join(
+                    f"  - {h['name']}: {h['time']:.1f}ms" for h in slow_hooks[:10]
+                )
+                if total_ms > 50:
+                    return {
+                        "name": "check_hook_performance",
+                        "status": "critical",
+                        "severity": "high",
+                        "details": (
+                            f"Plugin hooks consuming ~{total_ms:.0f}ms per tick "
+                            f"(budget is 33ms at 30fps — {total_ms/33*100:.0f}% used):\n"
+                            f"{hook_list}"
+                        ),
+                        "fix": [
+                            {"command_rcon": "oxide.plugins", "description": "List plugins with status", "destructive": False},
+                            {"command_rcon": f"oxide.unload {slow_hooks[0]['name'].split('.')[0]}",
+                             "description": f"Unload worst offender: {slow_hooks[0]['name']}", "destructive": True},
+                        ],
+                        "category": "performance",
+                    }
+                elif total_ms > 20:
+                    return {
+                        "name": "check_hook_performance",
+                        "status": "warning",
+                        "severity": "medium",
+                        "details": (
+                            f"Slow plugin hooks totaling ~{total_ms:.0f}ms per tick:\n"
+                            f"{hook_list}"
+                        ),
+                        "fix": None,
+                        "category": "performance",
+                    }
+                else:
+                    return self._ok(
+                        "check_hook_performance",
+                        f"{len(slow_hooks)} hooks above 5ms threshold, "
+                        f"total ~{total_ms:.0f}ms — acceptable",
+                        "performance",
+                    )
+            return self._ok("check_hook_performance", "All plugin hooks within normal limits", "performance")
+        except Exception as e:
+            return {
+                "name": "check_hook_performance",
+                "status": "error",
+                "severity": "low",
+                "details": f"Hook performance check failed: {e}",
+                "fix": None,
+                "category": "performance",
+            }
 
     # ------------------------------------------------------------------
     # Plugin management helpers

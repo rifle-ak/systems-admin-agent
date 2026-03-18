@@ -375,6 +375,43 @@ def _build_server_context(sid: str) -> dict:
     except Exception:
         pass
 
+    # ------------------------------------------------------------------
+    # Rust / Game server context — critical for the AI to know what
+    # environment it is working with so it doesn't assume WordPress etc.
+    # ------------------------------------------------------------------
+    rcon = _rcon_connections.get(sid)
+    ptero_data = _ptero_connections.get(sid)
+    if rcon or ptero_data:
+        ctx["server_type"] = "Rust game server (Oxide/uMod modded)"
+        ctx["management"] = "Pterodactyl Panel + RCON"
+        if rcon:
+            ctx["rcon_connected"] = "yes"
+        if ptero_data:
+            ctx["pterodactyl_connected"] = "yes"
+            if ptero_data.get("server_id"):
+                ctx["pterodactyl_server_id"] = ptero_data["server_id"]
+        ctx["server_context_notes"] = (
+            "This is a Rust game server managed via Pterodactyl Panel, NOT a "
+            "web server or WordPress site. 'Plugins' means Oxide/uMod .cs plugins "
+            "(C# scripts), NOT WordPress plugins. 'Hook times' means Oxide plugin "
+            "hook execution times checked via the RCON 'perf' command. Use RCON "
+            "commands (oxide.plugins, oxide.reload, perf, status, serverinfo, etc.) "
+            "and Pterodactyl file API for diagnostics. Config files are in "
+            "/server/rust/cfg/ (server.cfg or serverauto.cfg). Oxide logs are in "
+            "oxide/logs or Oxide/Logs. Do NOT suggest WordPress, wp-cli, PHP, or "
+            "web-server commands for this server."
+        )
+
+    # Store last diagnostic results if available
+    sdata = _get_session_data(sid)
+    if "rust_diagnostics" in sdata:
+        diag_summary = []
+        for d in sdata.get("rust_diagnostics", []):
+            if d.get("status") != "ok":
+                diag_summary.append(f"{d['name']}: {d['status']} — {d.get('details', '')[:100]}")
+        if diag_summary:
+            ctx["rust_diagnostic_issues"] = "; ".join(diag_summary[:10])
+
     return ctx
 
 
@@ -1689,6 +1726,9 @@ def handle_rust_run_diagnostics(data=None):
                                      ssh=ssh, on_progress=progress_cb,
                                      server_limits=server_limits)
         results = diag.run_all()
+
+        # Store results in session for AI context awareness
+        _get_session_data(sid)["rust_diagnostics"] = results
 
         emit("rust_diagnostics_result", {"diagnostics": results})
     except Exception as exc:
