@@ -354,15 +354,24 @@ class PterodactylAPI:
         return {"deleted": map_files}
 
     def rust_get_server_cfg(self, server_id) -> str:
-        """Read the Rust server.cfg file."""
-        try:
-            return self.get_file_contents(server_id, "/server/rust/cfg/server.cfg")
-        except PterodactylAPIError:
-            # Try alternate path
+        """Read the Rust server configuration file.
+
+        Checks multiple paths: server.cfg, serverauto.cfg, and alternate
+        directory layouts.
+        """
+        cfg_paths = [
+            "/server/rust/cfg/server.cfg",
+            "/server/rust/server.cfg",
+            "/server/rust/cfg/serverauto.cfg",
+        ]
+        for path in cfg_paths:
             try:
-                return self.get_file_contents(server_id, "/server/rust/server.cfg")
+                content = self.get_file_contents(server_id, path)
+                if content and content.strip():
+                    return content
             except PterodactylAPIError:
-                return ""
+                continue
+        return ""
 
     def rust_list_oxide_plugins(self, server_id) -> list:
         """List Oxide plugin files on disk."""
@@ -388,14 +397,27 @@ class PterodactylAPI:
         return self.write_file(server_id, path, config)
 
     def rust_get_oxide_logs(self, server_id, limit=50) -> list:
-        """List recent Oxide log files."""
-        try:
-            files = self.list_files(server_id, "/server/rust/oxide/logs")
-            log_files = sorted(
-                [f for f in files if f["is_file"]],
-                key=lambda f: f.get("modified_at", ""),
-                reverse=True,
-            )
-            return log_files[:limit]
-        except PterodactylAPIError:
-            return []
+        """List recent Oxide log files.
+
+        Tries multiple path variations since the directory casing can differ
+        between Oxide installations (oxide/logs vs Oxide/Logs).
+        """
+        log_paths = [
+            "/server/rust/oxide/logs",
+            "/server/rust/Oxide/Logs",
+            "/server/rust/Oxide/logs",
+            "/server/rust/oxide/Logs",
+        ]
+        for path in log_paths:
+            try:
+                files = self.list_files(server_id, path)
+                log_files = sorted(
+                    [f for f in files if f["is_file"]],
+                    key=lambda f: f.get("modified_at", ""),
+                    reverse=True,
+                )
+                if log_files:
+                    return log_files[:limit]
+            except PterodactylAPIError:
+                continue
+        return []
