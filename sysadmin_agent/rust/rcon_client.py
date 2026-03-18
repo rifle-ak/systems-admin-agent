@@ -1,26 +1,22 @@
-"""Source RCON protocol client for Rust game servers.
+"""WebSocket RCON client for Rust game servers.
 
-Implements the Valve Source RCON protocol used by Rust (via RustDedicated).
-Supports authentication, command execution, and multi-packet responses.
+Rust uses a WebSocket-based RCON protocol (not the Valve Source RCON TCP
+protocol).  The server listens on ws://<host>:<rcon_port>/<password> and
+exchanges JSON messages of the form:
 
-Protocol reference:
-  https://developer.valvesoftware.com/wiki/Source_RCON_Protocol
+    Send:    {"Identifier": <int>, "Message": "<command>", "Name": "WebRcon"}
+    Receive: {"Identifier": <int>, "Message": "<output>", "Type": "Generic"|"Warning"|...}
+
+Reference:
+  https://wiki.facepunch.com/rust/rcon
 """
 
+import json
 import logging
-import select
-import socket
-import struct
 import threading
 import time
 
 logger = logging.getLogger(__name__)
-
-# Packet types
-SERVERDATA_AUTH = 3
-SERVERDATA_AUTH_RESPONSE = 2
-SERVERDATA_EXECCOMMAND = 2
-SERVERDATA_RESPONSE_VALUE = 0
 
 
 class RCONError(Exception):
@@ -36,7 +32,7 @@ class RCONConnectionError(RCONError):
 
 
 class RCONClient:
-    """Source RCON client for Rust servers.
+    """WebSocket RCON client for Rust servers.
 
     Usage::
 
@@ -57,70 +53,114 @@ class RCONClient:
         self.port = port
         self.password = password
         self.timeout = timeout
-        self._sock = None
+        self._ws = None
         self._request_id = 0
         self._lock = threading.Lock()
-        self._authenticated = False
+        self._responses = {}   # id -> list of message strings
+        self._events = {}      # id -> threading.Event
+        self._listener = None
+        self._connected = False
+        self._closing = False
 
     @property
     def is_connected(self):
-        return self._sock is not None and self._authenticated
+        return self._connected and self._ws is not None
 
     def connect(self):
-        """Connect and authenticate with the RCON server."""
+        """Connect to the Rust RCON WebSocket server."""
         try:
-            self._sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            self._sock.settimeout(self.timeout)
-            self._sock.connect((self.host, self.port))
-        except (socket.error, OSError) as e:
-            self._sock = None
-            raise RCONConnectionError(f"Failed to connect to {self.host}:{self.port}: {e}")
+            import websocket
+        except ImportError:
+            raise RCONError(
+                "The 'websocket-client' package is required for Rust RCON. "
+                "Install it with: pip install websocket-client"
+            )
 
-        # Authenticate
-        req_id = self._next_id()
-        self._send_packet(req_id, SERVERDATA_AUTH, self.password)
+        url = f"ws://{self.host}:{self.port}/{self.password}"
+        logger.info("Connecting to Rust RCON at %s:%s", self.host, self.port)
 
-        # Read auth response — Rust may send an empty RESPONSE_VALUE first
-        for _ in range(3):
-            resp_id, resp_type, body = self._recv_packet()
-            if resp_type == SERVERDATA_AUTH_RESPONSE:
-                if resp_id == -1:
-                    self.disconnect()
-                    raise RCONAuthError("RCON authentication failed — wrong password")
-                self._authenticated = True
-                return self
-            # Some implementations send SERVERDATA_RESPONSE_VALUE before the auth response
+        try:
+            self._ws = websocket.WebSocket()
+            self._ws.settimeout(self.timeout)
+            self._ws.connect(url)
+        except websocket.WebSocketBadStatusException as e:
+            self._ws = None
+            if "401" in str(e) or "403" in str(e):
+                raise RCONAuthError(
+                    f"RCON authentication failed — wrong password: {e}"
+                )
+            raise RCONConnectionError(f"Failed to connect: {e}")
+        except Exception as e:
+            self._ws = None
+            raise RCONConnectionError(
+                f"Failed to connect to {self.host}:{self.port}: {e}"
+            )
 
-        self.disconnect()
-        raise RCONAuthError("RCON authentication failed — no valid response")
+        self._connected = True
+        self._closing = False
+
+        # Start background listener thread to collect responses
+        self._listener = threading.Thread(
+            target=self._listen_loop, daemon=True
+        )
+        self._listener.start()
+
+        logger.info("RCON connected to %s:%s", self.host, self.port)
+        return self
 
     def command(self, cmd, timeout=None):
-        """Execute an RCON command and return the response string.
-
-        Handles multi-packet responses by sending a trailing empty
-        SERVERDATA_RESPONSE_VALUE as a sentinel.
-        """
+        """Execute an RCON command and return the response string."""
         if not self.is_connected:
             raise RCONConnectionError("Not connected. Call connect() first.")
 
+        timeout = timeout or self.timeout
+        req_id = self._next_id()
+
+        # Prepare to receive
+        event = threading.Event()
+        self._responses[req_id] = []
+        self._events[req_id] = event
+
+        # Send command
+        payload = json.dumps({
+            "Identifier": req_id,
+            "Message": cmd,
+            "Name": "WebRcon",
+        })
+
         with self._lock:
-            old_timeout = self._sock.gettimeout()
-            if timeout:
-                self._sock.settimeout(timeout)
             try:
-                return self._do_command(cmd)
-            finally:
-                self._sock.settimeout(old_timeout)
+                self._ws.send(payload)
+            except Exception as e:
+                self._cleanup_request(req_id)
+                self._connected = False
+                raise RCONConnectionError(f"Failed to send command: {e}")
+
+        # Wait for response
+        if not event.wait(timeout=timeout):
+            result = "".join(self._responses.get(req_id, []))
+            self._cleanup_request(req_id)
+            if result:
+                return result
+            raise RCONError(f"Command timed out after {timeout}s: {cmd}")
+
+        result = "".join(self._responses.get(req_id, []))
+        self._cleanup_request(req_id)
+        return result
 
     def disconnect(self):
         """Close the RCON connection."""
-        self._authenticated = False
-        if self._sock:
+        self._closing = True
+        self._connected = False
+        if self._ws:
             try:
-                self._sock.close()
+                self._ws.close()
             except Exception:
                 pass
-            self._sock = None
+            self._ws = None
+        # Wake up any waiting commands
+        for event in self._events.values():
+            event.set()
 
     # ------------------------------------------------------------------
     # Context manager
@@ -209,92 +249,49 @@ class RCONClient:
         return self.command("pool.status")
 
     # ------------------------------------------------------------------
-    # Protocol internals
+    # Internal
     # ------------------------------------------------------------------
 
-    def _do_command(self, cmd):
-        """Send a command and collect the full multi-packet response."""
-        cmd_id = self._next_id()
-        sentinel_id = self._next_id()
-
-        # Send the command
-        self._send_packet(cmd_id, SERVERDATA_EXECCOMMAND, cmd)
-
-        # Send an empty command as a sentinel — the response to this tells us
-        # the real response is complete (Valve multi-packet trick)
-        self._send_packet(sentinel_id, SERVERDATA_RESPONSE_VALUE, "")
-
-        # Collect response packets until we see the sentinel response
-        response_parts = []
-        deadline = time.monotonic() + self.timeout
-
-        while time.monotonic() < deadline:
+    def _listen_loop(self):
+        """Background thread that reads WebSocket messages and dispatches
+        them to the correct waiting command by Identifier."""
+        while self._connected and not self._closing:
             try:
-                resp_id, resp_type, body = self._recv_packet()
-            except socket.timeout:
+                raw = self._ws.recv()
+                if not raw:
+                    continue
+            except Exception:
+                if not self._closing:
+                    self._connected = False
+                    # Wake all waiters
+                    for event in list(self._events.values()):
+                        event.set()
                 break
-            except (OSError, struct.error) as e:
-                raise RCONConnectionError(f"Connection lost: {e}")
 
-            if resp_id == sentinel_id:
-                # Got the sentinel — we have the complete response
-                break
-            if resp_id == cmd_id:
-                response_parts.append(body)
-
-        return "".join(response_parts)
-
-    def _send_packet(self, request_id, packet_type, body):
-        """Build and send a Source RCON packet."""
-        body_bytes = body.encode("utf-8") + b"\x00"
-        # Packet: size (4) + id (4) + type (4) + body + null terminator
-        packet = struct.pack("<iii", request_id, packet_type, 0)[:8]
-        packet = struct.pack("<ii", request_id, packet_type) + body_bytes + b"\x00"
-        size = len(packet)
-        packet = struct.pack("<i", size) + packet
-
-        try:
-            self._sock.sendall(packet)
-        except (socket.error, OSError) as e:
-            self._authenticated = False
-            raise RCONConnectionError(f"Failed to send: {e}")
-
-    def _recv_packet(self):
-        """Receive and parse a single Source RCON packet.
-
-        Returns (request_id, packet_type, body_string).
-        """
-        # Read 4-byte size prefix
-        raw_size = self._recv_exact(4)
-        (size,) = struct.unpack("<i", raw_size)
-
-        if size < 10 or size > 65536:
-            raise RCONError(f"Invalid packet size: {size}")
-
-        # Read the rest of the packet
-        raw = self._recv_exact(size)
-        request_id, packet_type = struct.unpack("<ii", raw[:8])
-        # Body is everything after id+type, minus the two null terminators
-        body = raw[8:].rstrip(b"\x00").decode("utf-8", errors="replace")
-
-        return request_id, packet_type, body
-
-    def _recv_exact(self, count):
-        """Read exactly `count` bytes from the socket."""
-        buf = b""
-        while len(buf) < count:
             try:
-                chunk = self._sock.recv(count - len(buf))
-            except socket.timeout:
-                raise
-            except (socket.error, OSError) as e:
-                self._authenticated = False
-                raise RCONConnectionError(f"Connection lost: {e}")
-            if not chunk:
-                self._authenticated = False
-                raise RCONConnectionError("Connection closed by server")
-            buf += chunk
-        return buf
+                msg = json.loads(raw)
+            except (json.JSONDecodeError, TypeError):
+                logger.debug("Non-JSON RCON message: %s", raw[:200])
+                continue
+
+            req_id = msg.get("Identifier", -1)
+            message = msg.get("Message", "")
+
+            if req_id in self._responses:
+                self._responses[req_id].append(message)
+                # Rust sends one response per command, signal immediately
+                event = self._events.get(req_id)
+                if event:
+                    event.set()
+            else:
+                # Unsolicited server message (broadcasts, etc.)
+                msg_type = msg.get("Type", "Generic")
+                logger.debug("RCON broadcast [%s]: %s", msg_type, message[:200])
+
+    def _cleanup_request(self, req_id):
+        """Remove tracking data for a completed request."""
+        self._responses.pop(req_id, None)
+        self._events.pop(req_id, None)
 
     def _next_id(self):
         self._request_id += 1
