@@ -1,11 +1,16 @@
+import logging
 import threading
 import time
 import paramiko
+
+logger = logging.getLogger(__name__)
 
 
 class SSHManager:
     # Most SSH servers allow 10 concurrent channels; stay safely under that.
     MAX_CONCURRENT_CHANNELS = 8
+    # Number of times to retry an operation after reconnecting
+    MAX_RETRIES = 2
 
     def __init__(self, host, port=22, username=None, password=None,
                  private_key_path=None, passphrase=None, timeout=15):
@@ -18,6 +23,7 @@ class SSHManager:
         self.timeout = timeout
         self._client = None
         self._channel_semaphore = threading.Semaphore(self.MAX_CONCURRENT_CHANNELS)
+        self._connect_lock = threading.Lock()
 
     @property
     def is_connected(self):
@@ -26,11 +32,25 @@ class SSHManager:
         transport = self._client.get_transport()
         return transport is not None and transport.is_active()
 
-    def connect(self):
-        if not self.username:
-            raise ValueError("Username is required")
-        if not self.password and not self.private_key_path:
-            raise ValueError("Either password or private_key_path is required")
+    def _ensure_connected(self):
+        """Check connection health and reconnect if the transport is dead."""
+        if self.is_connected:
+            return
+        logger.info("SSH connection lost to %s:%s, reconnecting...", self.host, self.port)
+        with self._connect_lock:
+            # Double-check after acquiring lock (another thread may have reconnected)
+            if self.is_connected:
+                return
+            self._do_connect()
+
+    def _do_connect(self):
+        """Internal connect logic (no validation, assumes lock is held or init)."""
+        # Close stale client if any
+        if self._client:
+            try:
+                self._client.close()
+            except Exception:
+                pass
 
         self._client = paramiko.SSHClient()
         self._client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
@@ -56,69 +76,121 @@ class SSHManager:
             self._client = None
             raise
 
+    def connect(self):
+        if not self.username:
+            raise ValueError("Username is required")
+        if not self.password and not self.private_key_path:
+            raise ValueError("Either password or private_key_path is required")
+
+        with self._connect_lock:
+            self._do_connect()
         return self
 
     def execute(self, command, timeout=30):
-        if not self.is_connected:
-            raise ConnectionError("Not connected. Call connect() first.")
-
-        with self._channel_semaphore:
-            stdin, stdout, stderr = self._client.exec_command(command, timeout=timeout)
-            exit_code = stdout.channel.recv_exit_status()
-
-            return {
-                "stdout": stdout.read().decode("utf-8", errors="replace"),
-                "stderr": stderr.read().decode("utf-8", errors="replace"),
-                "exit_code": exit_code,
-            }
+        """Execute a command, auto-reconnecting on stale connections."""
+        for attempt in range(self.MAX_RETRIES + 1):
+            try:
+                self._ensure_connected()
+                with self._channel_semaphore:
+                    stdin, stdout, stderr = self._client.exec_command(
+                        command, timeout=timeout
+                    )
+                    exit_code = stdout.channel.recv_exit_status()
+                    return {
+                        "stdout": stdout.read().decode("utf-8", errors="replace"),
+                        "stderr": stderr.read().decode("utf-8", errors="replace"),
+                        "exit_code": exit_code,
+                    }
+            except (OSError, paramiko.SSHException, paramiko.ChannelException) as e:
+                if attempt < self.MAX_RETRIES:
+                    logger.warning(
+                        "SSH execute failed (attempt %d/%d): %s — reconnecting",
+                        attempt + 1, self.MAX_RETRIES + 1, e,
+                    )
+                    # Force reconnect on next _ensure_connected
+                    if self._client:
+                        try:
+                            self._client.close()
+                        except Exception:
+                            pass
+                        self._client = None
+                    time.sleep(1)
+                else:
+                    raise
 
     def execute_sudo(self, command):
-        """Run a command with sudo, feeding the password to the prompt via a channel."""
-        if not self.is_connected:
-            raise ConnectionError("Not connected. Call connect() first.")
+        """Run a command with sudo, auto-reconnecting on stale connections."""
         if not self.password:
             raise ValueError("Password is required for sudo commands")
 
-        with self._channel_semaphore:
-            transport = self._client.get_transport()
-            channel = transport.open_session()
-            channel.get_pty()
-            channel.exec_command(f"sudo -S -p '' {command}")
+        for attempt in range(self.MAX_RETRIES + 1):
+            try:
+                self._ensure_connected()
+                with self._channel_semaphore:
+                    transport = self._client.get_transport()
+                    if not transport or not transport.is_active():
+                        raise paramiko.SSHException("Transport is not active")
 
-            # Wait briefly for the password prompt, then send password
-            time.sleep(0.5)
-            channel.send(self.password + "\n")
+                    channel = transport.open_session()
+                    channel.get_pty()
+                    channel.settimeout(30)
+                    channel.exec_command(f"sudo -S -p '' {command}")
 
-            # Read output after command completes
-            stdout_chunks = []
-            stderr_chunks = []
+                    # Wait briefly for the password prompt, then send password
+                    time.sleep(0.5)
+                    channel.send(self.password + "\n")
 
-            while not channel.exit_status_ready():
-                if channel.recv_ready():
-                    stdout_chunks.append(channel.recv(4096))
-                if channel.recv_stderr_ready():
-                    stderr_chunks.append(channel.recv_stderr(4096))
-                time.sleep(0.1)
+                    # Read output after command completes
+                    stdout_chunks = []
+                    stderr_chunks = []
+                    deadline = time.monotonic() + 120  # 2-minute max
 
-            # Drain remaining data
-            while channel.recv_ready():
-                stdout_chunks.append(channel.recv(4096))
-            while channel.recv_stderr_ready():
-                stderr_chunks.append(channel.recv_stderr(4096))
+                    while not channel.exit_status_ready():
+                        if time.monotonic() > deadline:
+                            channel.close()
+                            return {
+                                "stdout": b"".join(stdout_chunks).decode("utf-8", errors="replace"),
+                                "stderr": "Command timed out after 120 seconds",
+                                "exit_code": -1,
+                            }
+                        if channel.recv_ready():
+                            stdout_chunks.append(channel.recv(4096))
+                        if channel.recv_stderr_ready():
+                            stderr_chunks.append(channel.recv_stderr(4096))
+                        time.sleep(0.1)
 
-            exit_code = channel.recv_exit_status()
-            channel.close()
+                    # Drain remaining data
+                    while channel.recv_ready():
+                        stdout_chunks.append(channel.recv(4096))
+                    while channel.recv_stderr_ready():
+                        stderr_chunks.append(channel.recv_stderr(4096))
 
-            return {
-                "stdout": b"".join(stdout_chunks).decode("utf-8", errors="replace"),
-                "stderr": b"".join(stderr_chunks).decode("utf-8", errors="replace"),
-                "exit_code": exit_code,
-            }
+                    exit_code = channel.recv_exit_status()
+                    channel.close()
+
+                    return {
+                        "stdout": b"".join(stdout_chunks).decode("utf-8", errors="replace"),
+                        "stderr": b"".join(stderr_chunks).decode("utf-8", errors="replace"),
+                        "exit_code": exit_code,
+                    }
+            except (OSError, paramiko.SSHException, paramiko.ChannelException) as e:
+                if attempt < self.MAX_RETRIES:
+                    logger.warning(
+                        "SSH execute_sudo failed (attempt %d/%d): %s — reconnecting",
+                        attempt + 1, self.MAX_RETRIES + 1, e,
+                    )
+                    if self._client:
+                        try:
+                            self._client.close()
+                        except Exception:
+                            pass
+                        self._client = None
+                    time.sleep(1)
+                else:
+                    raise
 
     def upload_file(self, local_path, remote_path):
-        if not self.is_connected:
-            raise ConnectionError("Not connected. Call connect() first.")
-
+        self._ensure_connected()
         sftp = self._client.open_sftp()
         try:
             sftp.put(local_path, remote_path)
@@ -126,9 +198,7 @@ class SSHManager:
             sftp.close()
 
     def download_file(self, remote_path, local_path):
-        if not self.is_connected:
-            raise ConnectionError("Not connected. Call connect() first.")
-
+        self._ensure_connected()
         sftp = self._client.open_sftp()
         try:
             sftp.get(remote_path, local_path)
