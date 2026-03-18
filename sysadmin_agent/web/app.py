@@ -288,15 +288,9 @@ def _get_brain(sid: str):
     Also hooks into the global persistent token tracker."""
     if sid not in _brains:
         mods = _import_agent_modules()
-        brain = mods["AgentBrain"]()
-        # Wrap _track_usage to also feed the global persistent tracker
-        original_track = brain._track_usage
-
-        def _wrapped_track(usage):
-            original_track(usage)
-            _token_tracker.add_usage(usage.input_tokens, usage.output_tokens)
-
-        brain._track_usage = _wrapped_track
+        brain = mods["AgentBrain"](
+            usage_callback=lambda inp, out: _token_tracker.add_usage(inp, out),
+        )
         _brains[sid] = brain
     return _brains[sid]
 
@@ -1317,13 +1311,35 @@ def do_upgrade():
 @app.route("/api/restart", methods=["POST"])
 @_require_auth
 def do_restart():
-    """Restart the application process."""
+    """Restart the application process.
+
+    Properly shuts down the SocketIO server and closes the listening socket
+    before exec-ing a new process to avoid 'Address already in use' errors.
+    """
     def _restart():
         import time as _time
+        import signal
         _time.sleep(1)
+
+        # Close all SSH connections
+        for sid, ssh in list(_ssh_connections.items()):
+            try:
+                ssh.disconnect()
+            except Exception:
+                pass
+        _ssh_connections.clear()
+
+        # Stop the SocketIO/Flask server
+        try:
+            socketio.stop()
+        except Exception:
+            pass
+
+        _time.sleep(1)
+
+        # Re-exec the process
         os.execv(sys.executable, [sys.executable] + sys.argv)
 
-    # Run restart in background so we can send the response first
     threading.Thread(target=_restart, daemon=True).start()
     return jsonify({"status": "ok", "message": "Restarting..."})
 

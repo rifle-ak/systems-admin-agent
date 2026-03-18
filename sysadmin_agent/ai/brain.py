@@ -57,7 +57,8 @@ Respond with valid JSON only:
 
 
 class AgentBrain:
-    def __init__(self, api_key=None, model="claude-sonnet-4-20250514"):
+    def __init__(self, api_key=None, model="claude-sonnet-4-20250514",
+                 usage_callback=None):
         self.api_key = api_key or os.environ.get("ANTHROPIC_API_KEY")
         if not self.api_key:
             raise ValueError("No API key provided. Set ANTHROPIC_API_KEY or pass api_key.")
@@ -66,11 +67,17 @@ class AgentBrain:
         self._total_input_tokens = 0
         self._total_output_tokens = 0
         self._total_requests = 0
+        self._usage_callback = usage_callback
 
     def _track_usage(self, usage):
         self._total_input_tokens += usage.input_tokens
         self._total_output_tokens += usage.output_tokens
         self._total_requests += 1
+        if self._usage_callback:
+            try:
+                self._usage_callback(usage.input_tokens, usage.output_tokens)
+            except Exception:
+                pass
 
     def _parse_json_response(self, text):
         text = text.strip()

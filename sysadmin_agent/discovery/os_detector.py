@@ -18,7 +18,7 @@ class OSDetector:
         }
 
         results = {}
-        with ThreadPoolExecutor(max_workers=len(commands)) as executor:
+        with ThreadPoolExecutor(max_workers=3) as executor:
             futures = {
                 executor.submit(self.ssh.execute, cmd): name
                 for name, cmd in commands.items()

@@ -18,7 +18,8 @@ class AppDiscovery:
         }
 
         results = {}
-        with ThreadPoolExecutor(max_workers=len(categories)) as executor:
+        # Limit concurrency to avoid overwhelming the SSH connection
+        with ThreadPoolExecutor(max_workers=3) as executor:
             futures = {
                 executor.submit(fn): name
                 for name, fn in categories.items()

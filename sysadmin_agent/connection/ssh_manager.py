@@ -7,8 +7,8 @@ logger = logging.getLogger(__name__)
 
 
 class SSHManager:
-    # Most SSH servers allow 10 concurrent channels; stay safely under that.
-    MAX_CONCURRENT_CHANNELS = 8
+    # Keep well under the SSH server's channel limit to avoid rejections.
+    MAX_CONCURRENT_CHANNELS = 5
     # Number of times to retry an operation after reconnecting
     MAX_RETRIES = 2
 

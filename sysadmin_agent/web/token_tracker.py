@@ -16,6 +16,10 @@ class TokenTracker:
         self._billing_cycle_day = billing_cycle_day
         self._lock = threading.Lock()
         self._data = self._load()
+        # Session counters reset each time the process starts
+        self._data["session_input"] = 0
+        self._data["session_output"] = 0
+        self._data["session_requests"] = 0
 
     # ------------------------------------------------------------------
     # Public API
