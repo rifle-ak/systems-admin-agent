@@ -1597,17 +1597,63 @@ function onPteroConnected(data) {
     if ($('#pteroConnected')) $('#pteroConnected').style.display = 'flex';
     if ($('#rustSaveSection')) $('#rustSaveSection').style.display = 'block';
 
+    const servers = data.servers || [];
+    const selectedId = data.selected_server || '';
+
+    // Find the selected server's name for display
+    const selectedServer = servers.find(s => s.identifier === selectedId);
+    const selectedName = selectedServer ? selectedServer.name : selectedId;
+
     let msg = 'Pterodactyl Panel connected.';
-    if (data.servers && data.servers.length > 0) {
-        msg += ` Found ${data.servers.length} server(s).`;
-        if (data.selected_server) {
-            msg += ` Selected: ${escapeHtml(data.selected_server)}`;
+    if (servers.length > 0) {
+        msg += ` Found ${servers.length} server(s):\n`;
+        for (const s of servers) {
+            const marker = s.identifier === selectedId ? ' ← selected' : '';
+            const desc = s.description ? ` — ${s.description}` : '';
+            msg += `  • <strong>${escapeHtml(s.name || s.identifier)}</strong>${escapeHtml(desc)}${marker}\n`;
+        }
+        if (selectedName) {
+            msg += `\nActive server: <strong>${escapeHtml(selectedName)}</strong>`;
         }
     }
     addMessage('system', msg);
+
+    // If multiple servers, show a selector so the user can switch
+    if (servers.length > 1) {
+        let selectHtml = '<div class="ptero-server-select" style="margin:8px 0;">';
+        selectHtml += '<label>Switch server: </label>';
+        selectHtml += '<select id="pteroServerSelect" onchange="switchPteroServer(this.value)">';
+        for (const s of servers) {
+            const sel = s.identifier === selectedId ? ' selected' : '';
+            const label = s.name || s.identifier;
+            selectHtml += `<option value="${escapeHtml(s.identifier)}"${sel}>${escapeHtml(label)}</option>`;
+        }
+        selectHtml += '</select></div>';
+        addMessage('system', selectHtml);
+    }
+
     if (data.warning) {
         addMessage('system', `⚠️ ${escapeHtml(data.warning)}`);
     }
+}
+
+function switchPteroServer(serverId) {
+    if (!serverId) return;
+    addMessage('system', `Switching to server ${escapeHtml(serverId)}...`);
+    // Re-emit with the new server_id — the backend will update the stored connection
+    const payload = { server_id: serverId };
+    // Reuse existing connection credentials
+    if (_pteroState.url) payload.base_url = _pteroState.url;
+    if (_pteroState.apiKeyEntered) {
+        const apiKey = ($('#pteroApiKey') || {}).value || '';
+        if (apiKey) payload.api_key = apiKey;
+    }
+    if (_pteroState.apiKeySaved) {
+        payload.use_saved_key = true;
+        const profileSelect = $('#profileSelect');
+        if (profileSelect?.value) payload.profile_name = profileSelect.value;
+    }
+    socket.emit('rust_connect_pterodactyl', payload);
 }
 
 function onPteroDisconnected() {
