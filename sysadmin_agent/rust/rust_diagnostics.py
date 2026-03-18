@@ -1783,12 +1783,80 @@ class RustServerDiagnostics:
         except Exception:
             return None
 
+    def _discover_all_log_sources(self):
+        """Scan the container file system for ALL log directories and files.
+
+        Walks the top two directory levels looking for directories named
+        'logs', 'log', or files ending in .log/.txt that look like logs.
+        Returns a list of (display_name, full_path, is_dir) tuples.
+        """
+        if not self.ptero or not self.server_id:
+            return []
+
+        sources = []
+        seen_paths = set()
+
+        search_roots = ["/", "/server/rust", "/home/container", "/server"]
+        log_dir_names = {"logs", "log"}
+
+        for root in search_roots:
+            try:
+                entries = self.ptero.list_files(self.server_id, root)
+            except Exception:
+                continue
+
+            for entry in entries:
+                name = entry["name"]
+                name_lower = name.lower()
+                full_path = f"{root}/{name}" if root != "/" else f"/{name}"
+
+                if full_path in seen_paths:
+                    continue
+                seen_paths.add(full_path)
+
+                if entry["is_file"]:
+                    # Log-like files at the root level
+                    if (name_lower.endswith(".log") or
+                        name_lower.endswith(".txt") and
+                        ("log" in name_lower or "crash" in name_lower or
+                         "error" in name_lower or "output" in name_lower)):
+                        sources.append((name, full_path, False))
+                else:
+                    # Check if this is a logs directory
+                    if name_lower in log_dir_names:
+                        sources.append((f"{root}/{name}", full_path, True))
+                    else:
+                        # Recurse one level into subdirectories to find logs/
+                        try:
+                            sub_entries = self.ptero.list_files(
+                                self.server_id, full_path)
+                            for sub in sub_entries:
+                                sub_name = sub["name"]
+                                sub_lower = sub["name"].lower()
+                                sub_path = f"{full_path}/{sub_name}"
+                                if sub_path in seen_paths:
+                                    continue
+                                seen_paths.add(sub_path)
+
+                                if not sub["is_file"] and sub_lower in log_dir_names:
+                                    sources.append((
+                                        f"{name}/{sub_name}", sub_path, True))
+                                elif sub["is_file"] and (
+                                    sub_lower.endswith(".log") or
+                                    (sub_lower.endswith(".txt") and
+                                     "log" in sub_lower)):
+                                    sources.append((
+                                        f"{name}/{sub_name}", sub_path, False))
+                        except Exception:
+                            continue
+
+        return sources
+
     def check_server_logs(self):
         """Comprehensive scan of ALL available server logs.
 
-        Reads full content (not just tail) of up to 10 Oxide log files,
-        5 Steam log files, and console output. Reports scan coverage
-        so the user knows exactly what was checked.
+        Discovers all log directories and files across the entire container,
+        not just known paths. Reads full content and classifies each line.
         """
         if not self.ptero or not self.server_id:
             return None
@@ -1915,6 +1983,82 @@ class RustServerDiagnostics:
                                 "level": level,
                                 "line": line.strip()[:200],
                             })
+        except Exception:
+            pass
+
+        # 4. Broad discovery — find any log dirs/files we missed above
+        try:
+            all_sources = self._discover_all_log_sources()
+            already_scanned = set()
+            for src_name in sources_checked:
+                already_scanned.add(src_name.lower())
+
+            for display_name, full_path, is_dir in all_sources:
+                # Skip sources we already scanned
+                if any(s.lower() in display_name.lower() for s in
+                       ("oxide", "steam", "output_log", "server_console",
+                        "Log.EAC", "latest.log")):
+                    # Already covered by sections 1-3
+                    if any(display_name.lower() in s.lower()
+                           for s in sources_checked):
+                        continue
+
+                if is_dir:
+                    # Read files from this log directory
+                    try:
+                        dir_files = self.ptero.list_files(
+                            self.server_id, full_path)
+                        log_entries = sorted(
+                            [f for f in dir_files if f["is_file"]],
+                            key=lambda f: f.get("modified_at", ""),
+                            reverse=True,
+                        )
+                        dir_files_read = 0
+                        for lf in log_entries[:5]:
+                            try:
+                                content = self.ptero.get_file_contents(
+                                    self.server_id,
+                                    f"{full_path}/{lf['name']}")
+                                if content:
+                                    dir_files_read += 1
+                                    total_files += 1
+                                    lines = content.splitlines()
+                                    total_lines += len(lines)
+                                    for line in lines:
+                                        level = _classify_general_line(line)
+                                        if level:
+                                            issues.append({
+                                                "source": f"{display_name}/{lf['name']}",
+                                                "level": level,
+                                                "line": line.strip()[:200],
+                                            })
+                            except Exception:
+                                continue
+                        if dir_files_read:
+                            sources_checked.append(
+                                f"{display_name} ({dir_files_read} files)")
+                    except Exception:
+                        continue
+                else:
+                    # Single file
+                    try:
+                        content = self.ptero.get_file_contents(
+                            self.server_id, full_path)
+                        if content:
+                            total_files += 1
+                            lines = content.splitlines()
+                            total_lines += len(lines)
+                            sources_checked.append(display_name)
+                            for line in lines:
+                                level = _classify_general_line(line)
+                                if level:
+                                    issues.append({
+                                        "source": display_name,
+                                        "level": level,
+                                        "line": line.strip()[:200],
+                                    })
+                    except Exception:
+                        continue
         except Exception:
             pass
 
