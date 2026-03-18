@@ -630,7 +630,11 @@ class RustServerDiagnostics:
     # ------------------------------------------------------------------
 
     def _discover_oxide_log_dir(self):
-        """Find the actual Oxide log directory by trying all casing variants.
+        """Find the actual Oxide log directory dynamically.
+
+        Uses the Pterodactyl API to list /server/rust/ and find the actual
+        Oxide folder name, then discovers the logs subdirectory within it.
+        Falls back to trying hardcoded path variants.
 
         Caches the result so subsequent reads don't repeat the discovery.
         """
@@ -638,6 +642,21 @@ class RustServerDiagnostics:
             return self._oxide_log_dir
         if not self.ptero or not self.server_id:
             return None
+
+        # Dynamic discovery: find actual Oxide root, then its logs subdir
+        oxide_root = self.ptero._discover_oxide_root(self.server_id)
+        if oxide_root:
+            subdirs = self.ptero._discover_oxide_subdirs(self.server_id, oxide_root)
+            if "logs" in subdirs:
+                try:
+                    files = self.ptero.list_files(self.server_id, subdirs["logs"])
+                    if files:
+                        self._oxide_log_dir = subdirs["logs"]
+                        return self._oxide_log_dir
+                except Exception:
+                    pass
+
+        # Fallback to hardcoded paths
         for path in self._OXIDE_LOG_DIRS:
             try:
                 files = self.ptero.list_files(self.server_id, path)
@@ -682,60 +701,148 @@ class RustServerDiagnostics:
                 continue
         return None
 
-    def _read_steam_logs(self, max_files=5):
-        """Read Steam log files, trying both directory casings.
+    def _discover_steam_log_dir(self):
+        """Find the actual Steam logs directory dynamically.
 
+        Searches multiple container root paths since the layout varies
+        by Pterodactyl egg. The path might be /Steam/logs, /server/rust/Steam/logs,
+        /home/container/Steam/logs, etc.
+        """
+        if not self.ptero or not self.server_id:
+            return None
+
+        search_roots = [
+            "/server/rust",
+            "/",
+            "/home/container",
+            "/server",
+        ]
+
+        for root in search_roots:
+            try:
+                root_files = self.ptero.list_files(self.server_id, root)
+                for f in root_files:
+                    if not f["is_file"] and f["name"].lower() == "steam":
+                        steam_root = f"{root}/{f['name']}" if root != "/" else f"/{f['name']}"
+                        # Look for logs subdir
+                        try:
+                            steam_contents = self.ptero.list_files(
+                                self.server_id, steam_root)
+                            for sf in steam_contents:
+                                if not sf["is_file"] and sf["name"].lower() == "logs":
+                                    return f"{steam_root}/{sf['name']}"
+                        except Exception:
+                            pass
+            except Exception:
+                continue
+
+        # Hardcoded fallback
+        for path in ["/Steam/logs", "/server/rust/Steam/logs",
+                     "/steam/logs", "/server/rust/steam/logs",
+                     "/home/container/Steam/logs"]:
+            try:
+                files = self.ptero.list_files(self.server_id, path)
+                if files:
+                    return path
+            except Exception:
+                continue
+        return None
+
+    def _read_steam_logs(self, max_files=5):
+        """Read Steam log files.
+
+        Discovers the actual Steam logs directory dynamically.
         Returns list of (filename, content) tuples.
         """
         if not self.ptero or not self.server_id:
             return []
 
-        steam_dirs = ["/server/rust/Steam/logs", "/server/rust/steam/logs"]
-        for steam_dir in steam_dirs:
-            try:
-                files = self.ptero.list_files(self.server_id, steam_dir)
-                logs = sorted(
-                    [f for f in files if f["is_file"]],
-                    key=lambda f: f.get("modified_at", ""),
-                    reverse=True,
-                )
-                results = []
-                for sf in logs[:max_files]:
-                    try:
-                        content = self.ptero.get_file_contents(
-                            self.server_id, f"{steam_dir}/{sf['name']}"
-                        )
-                        if content:
-                            results.append((sf["name"], content))
-                    except Exception:
-                        continue
-                if results:
-                    return results
-            except Exception:
-                continue
-        return []
+        steam_dir = self._discover_steam_log_dir()
+        if not steam_dir:
+            return []
+
+        try:
+            files = self.ptero.list_files(self.server_id, steam_dir)
+            logs = sorted(
+                [f for f in files if f["is_file"]],
+                key=lambda f: f.get("modified_at", ""),
+                reverse=True,
+            )
+            results = []
+            for sf in logs[:max_files]:
+                try:
+                    content = self.ptero.get_file_contents(
+                        self.server_id, f"{steam_dir}/{sf['name']}"
+                    )
+                    if content:
+                        results.append((sf["name"], content))
+                except Exception:
+                    continue
+            return results
+        except Exception:
+            return []
 
     def _read_console_logs(self):
         """Read server console output logs.
 
+        Searches multiple container roots for log-like files since the
+        layout varies by Pterodactyl egg.
         Returns list of (filename, content) tuples.
         """
         if not self.ptero or not self.server_id:
             return []
 
-        console_paths = [
-            "/server/rust/RustDedicated_Data/output_log.txt",
-            "/server/rust/output_log.txt",
-            "/server/rust/server_console.log",
-        ]
         results = []
-        for path in console_paths:
+        seen_names = set()
+
+        # Check hardcoded paths across multiple roots
+        roots = ["/server/rust", "/", "/home/container", "/server"]
+        console_files = [
+            "RustDedicated_Data/output_log.txt",
+            "output_log.txt",
+            "server_console.log",
+        ]
+        for root in roots:
+            for cf in console_files:
+                path = f"{root}/{cf}" if root != "/" else f"/{cf}"
+                fname = cf.split("/")[-1]
+                if fname in seen_names:
+                    continue
+                try:
+                    content = self.ptero.get_file_contents(self.server_id, path)
+                    if content:
+                        results.append((fname, content))
+                        seen_names.add(fname)
+                except Exception:
+                    continue
+
+        # Scan each root for .log files and crash/error/dump files
+        for root in roots:
             try:
-                content = self.ptero.get_file_contents(self.server_id, path)
-                if content:
-                    results.append((path.split("/")[-1], content))
+                root_files = self.ptero.list_files(self.server_id, root)
+                for f in root_files:
+                    if not f["is_file"]:
+                        continue
+                    name = f["name"]
+                    name_lower = name.lower()
+                    if name in seen_names:
+                        continue
+                    if (name_lower.endswith(".log") or
+                        ("log" in name_lower and name_lower.endswith(".txt")) or
+                        "crash" in name_lower or "error" in name_lower or
+                        "dump" in name_lower):
+                        path = f"{root}/{name}" if root != "/" else f"/{name}"
+                        try:
+                            content = self.ptero.get_file_contents(
+                                self.server_id, path)
+                            if content:
+                                results.append((name, content))
+                                seen_names.add(name)
+                        except Exception:
+                            continue
             except Exception:
                 continue
+
         return results
 
     # ------------------------------------------------------------------

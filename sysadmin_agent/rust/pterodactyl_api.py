@@ -356,28 +356,96 @@ class PterodactylAPI:
     def rust_get_server_cfg(self, server_id) -> str:
         """Read the Rust server configuration file.
 
-        Checks multiple paths: server.cfg, serverauto.cfg, and alternate
-        directory layouts.
+        Searches multiple container roots and config file names since
+        the layout varies by Pterodactyl egg.
         """
-        cfg_paths = [
-            "/server/rust/cfg/server.cfg",
-            "/server/rust/server.cfg",
-            "/server/rust/cfg/serverauto.cfg",
+        roots = ["/server/rust", "/", "/home/container", "/server"]
+        cfg_names = ["cfg/server.cfg", "server.cfg", "cfg/serverauto.cfg",
+                     "serverauto.cfg"]
+        for root in roots:
+            for name in cfg_names:
+                path = f"{root}/{name}" if root != "/" else f"/{name}"
+                try:
+                    content = self.get_file_contents(server_id, path)
+                    if content and content.strip():
+                        return content
+                except PterodactylAPIError:
+                    continue
+        return ""
+
+    def _discover_oxide_root(self, server_id) -> str | None:
+        """Discover the actual Oxide root directory.
+
+        Searches multiple possible parent directories since the container
+        layout varies by egg/setup. The Pterodactyl file API root is the
+        container root, so paths may be /oxide/, /server/rust/oxide/, etc.
+
+        Returns the full path like '/server/rust/oxide' or '/oxide' or None.
+        """
+        search_roots = [
+            "/server/rust",
+            "/",
+            "/home/container",
+            "/server",
         ]
-        for path in cfg_paths:
+        for root in search_roots:
             try:
-                content = self.get_file_contents(server_id, path)
-                if content and content.strip():
-                    return content
+                files = self.list_files(server_id, root)
+                for f in files:
+                    if not f["is_file"] and f["name"].lower() == "oxide":
+                        path = f"{root}/{f['name']}" if root != "/" else f"/{f['name']}"
+                        return path
             except PterodactylAPIError:
                 continue
-        return ""
+        return None
+
+    def _discover_oxide_subdirs(self, server_id, oxide_root) -> dict:
+        """List subdirectories of the Oxide root and map them by purpose.
+
+        Returns a dict like {'plugins': '/server/rust/oxide/plugins',
+                             'logs': '/server/rust/oxide/logs', ...}
+        """
+        result = {}
+        try:
+            files = self.list_files(server_id, oxide_root)
+            for f in files:
+                if f["is_file"]:
+                    continue
+                name_lower = f["name"].lower()
+                full_path = f"{oxide_root}/{f['name']}"
+                if name_lower == "plugins":
+                    result["plugins"] = full_path
+                elif name_lower == "logs":
+                    result["logs"] = full_path
+                elif name_lower == "config":
+                    result["config"] = full_path
+                elif name_lower == "data":
+                    result["data"] = full_path
+                elif name_lower == "lang":
+                    result["lang"] = full_path
+        except PterodactylAPIError:
+            pass
+        return result
 
     def rust_list_oxide_plugins(self, server_id) -> list:
         """List Oxide plugin files on disk.
 
-        Tries multiple path casings since Oxide installations vary.
+        Discovers the actual Oxide directory structure dynamically.
         """
+        # Dynamic discovery
+        oxide_root = self._discover_oxide_root(server_id)
+        if oxide_root:
+            subdirs = self._discover_oxide_subdirs(server_id, oxide_root)
+            if "plugins" in subdirs:
+                try:
+                    files = self.list_files(server_id, subdirs["plugins"])
+                    plugins = [f for f in files if f["is_file"] and f["name"].endswith(".cs")]
+                    if plugins:
+                        return plugins
+                except PterodactylAPIError:
+                    pass
+
+        # Fallback to hardcoded paths
         plugin_paths = [
             "/server/rust/oxide/plugins",
             "/server/rust/Oxide/Plugins",
@@ -396,6 +464,20 @@ class PterodactylAPI:
 
     def rust_get_oxide_config(self, server_id, plugin_name) -> str:
         """Read an Oxide plugin config file."""
+        # Dynamic discovery
+        oxide_root = self._discover_oxide_root(server_id)
+        if oxide_root:
+            subdirs = self._discover_oxide_subdirs(server_id, oxide_root)
+            if "config" in subdirs:
+                try:
+                    content = self.get_file_contents(
+                        server_id, f"{subdirs['config']}/{plugin_name}.json")
+                    if content:
+                        return content
+                except PterodactylAPIError:
+                    pass
+
+        # Fallback
         config_paths = [
             f"/server/rust/oxide/config/{plugin_name}.json",
             f"/server/rust/Oxide/Config/{plugin_name}.json",
@@ -412,21 +494,31 @@ class PterodactylAPI:
 
     def rust_write_oxide_config(self, server_id, plugin_name, config) -> dict:
         """Write an Oxide plugin config file."""
-        # Try to find the existing config path first
-        config_paths = [
-            f"/server/rust/oxide/config/{plugin_name}.json",
-            f"/server/rust/Oxide/Config/{plugin_name}.json",
-            f"/server/rust/Oxide/config/{plugin_name}.json",
-        ]
-        write_path = config_paths[0]  # default
-        for path in config_paths:
-            try:
-                existing = self.get_file_contents(server_id, path)
-                if existing:
-                    write_path = path
-                    break
-            except PterodactylAPIError:
-                continue
+        # Dynamic discovery for the right config path
+        write_path = None
+        oxide_root = self._discover_oxide_root(server_id)
+        if oxide_root:
+            subdirs = self._discover_oxide_subdirs(server_id, oxide_root)
+            if "config" in subdirs:
+                write_path = f"{subdirs['config']}/{plugin_name}.json"
+
+        if not write_path:
+            # Fallback: try to find the existing config path
+            config_paths = [
+                f"/server/rust/oxide/config/{plugin_name}.json",
+                f"/server/rust/Oxide/Config/{plugin_name}.json",
+                f"/server/rust/Oxide/config/{plugin_name}.json",
+            ]
+            write_path = config_paths[0]
+            for path in config_paths:
+                try:
+                    existing = self.get_file_contents(server_id, path)
+                    if existing:
+                        write_path = path
+                        break
+                except PterodactylAPIError:
+                    continue
+
         if isinstance(config, dict):
             config = json.dumps(config, indent=2)
         return self.write_file(server_id, write_path, config)
@@ -434,9 +526,27 @@ class PterodactylAPI:
     def rust_get_oxide_logs(self, server_id, limit=50) -> list:
         """List recent Oxide log files.
 
-        Tries multiple path variations since the directory casing can differ
-        between Oxide installations (oxide/logs vs Oxide/Logs).
+        Discovers the actual Oxide directory structure dynamically,
+        then falls back to hardcoded path variations.
         """
+        # Dynamic discovery
+        oxide_root = self._discover_oxide_root(server_id)
+        if oxide_root:
+            subdirs = self._discover_oxide_subdirs(server_id, oxide_root)
+            if "logs" in subdirs:
+                try:
+                    files = self.list_files(server_id, subdirs["logs"])
+                    log_files = sorted(
+                        [f for f in files if f["is_file"]],
+                        key=lambda f: f.get("modified_at", ""),
+                        reverse=True,
+                    )
+                    if log_files:
+                        return log_files[:limit]
+                except PterodactylAPIError:
+                    pass
+
+        # Fallback to hardcoded paths
         log_paths = [
             "/server/rust/oxide/logs",
             "/server/rust/Oxide/Logs",
