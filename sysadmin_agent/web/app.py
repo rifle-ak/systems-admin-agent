@@ -823,21 +823,36 @@ def handle_connect_server(data):
         private_key_path = data.get("private_key_path") or data.get("key_path")
         passphrase = data.get("passphrase")
 
-        # If no password provided, check if there's a saved one in profiles
+        # If no password provided, check saved profiles for credentials
         if not password and not private_key_path:
             import base64
-            for _pname, prof in server_profiles.items():
-                if (isinstance(prof, dict)
-                        and prof.get("host") == host
-                        and prof.get("username", "") == username
-                        and prof.get("password_obf")):
+
+            # First try direct lookup by profile_name if provided
+            profile_name = data.get("profile_name", "")
+            prof = None
+            if profile_name and profile_name in server_profiles:
+                prof = server_profiles[profile_name]
+            else:
+                # Fall back to matching by host+username
+                for _pname, _prof in server_profiles.items():
+                    if (isinstance(_prof, dict)
+                            and _prof.get("host") == host
+                            and _prof.get("username", "") == username):
+                        prof = _prof
+                        break
+
+            if prof and isinstance(prof, dict):
+                # Check for saved password
+                if prof.get("password_obf"):
                     try:
                         password = base64.b64decode(
                             prof["password_obf"].encode("ascii")
                         ).decode("utf-8")
                     except Exception:
                         pass
-                    break
+                # Check for saved key path
+                if not password and prof.get("key_path"):
+                    private_key_path = prof["key_path"]
 
         emit("status", {"message": f"Connecting to {host}:{port}..."})
 

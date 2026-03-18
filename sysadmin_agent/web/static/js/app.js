@@ -794,6 +794,12 @@ function connectServer(e) {
         passphrase: authType === 'key' ? ($('#passphrase')?.value || undefined) : undefined,
     };
 
+    // Include selected profile name so the backend can look up saved credentials
+    const profileSelect = $('#profileSelect');
+    if (profileSelect?.value) {
+        payload.profile_name = profileSelect.value;
+    }
+
     setConnectionStatus('connecting', 'Connecting...');
     addMessage('system', `Connecting to ${escapeHtml(payload.host)}:${payload.port}...`);
     socket.emit('connect_server', payload);
