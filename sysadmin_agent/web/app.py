@@ -1360,7 +1360,8 @@ def do_restart():
     def _restart():
         import time as _time
         import signal
-        _time.sleep(1)
+        import socket as _socket
+        _time.sleep(0.5)
 
         # Close all SSH connections
         for sid, ssh in list(_ssh_connections.items()):
@@ -1370,13 +1371,71 @@ def do_restart():
                 pass
         _ssh_connections.clear()
 
-        # Stop the SocketIO/Flask server
+        # Close all RCON connections
+        for sid, rcon in list(_rcon_connections.items()):
+            try:
+                rcon.close()
+            except Exception:
+                pass
+        _rcon_connections.clear()
+
+        # Force-close the listening socket(s) to free the port.
+        # werkzeug stores the socket on the server object; walk up from
+        # the WSGI server to find it.
+        _freed = False
+        try:
+            # Flask-SocketIO with werkzeug uses socketio.server.eio
+            # but the actual TCP socket is on the werkzeug server.
+            # Find it via the werkzeug shutdown mechanism.
+            func = request.environ.get("werkzeug.server.shutdown")
+            if func:
+                func()
+                _freed = True
+        except Exception:
+            pass
+
+        # Stop SocketIO server
         try:
             socketio.stop()
         except Exception:
             pass
 
-        _time.sleep(1)
+        # Brute-force: find and close any socket bound to our port.
+        # This handles the case where socketio.stop() doesn't release
+        # the port in time.
+        port = int(os.environ.get("WEB_PORT", "5000"))
+        try:
+            # Try to close the fd by scanning /proc/self for the listening socket
+            import glob as _glob
+            for fd_path in _glob.glob("/proc/self/fd/*"):
+                try:
+                    fd_num = int(os.path.basename(fd_path))
+                    sock = _socket.fromfd(fd_num, _socket.AF_INET, _socket.SOCK_STREAM)
+                    try:
+                        addr = sock.getsockname()
+                        if addr[1] == port:
+                            sock.close()
+                            os.close(fd_num)
+                            _freed = True
+                    except (OSError, _socket.error):
+                        sock.detach()  # don't close if not our socket
+                except (ValueError, OSError):
+                    pass
+        except Exception:
+            pass
+
+        # Wait for port to actually be free
+        for _attempt in range(20):
+            try:
+                probe = _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM)
+                probe.setsockopt(_socket.SOL_SOCKET, _socket.SO_REUSEADDR, 1)
+                probe.bind(("0.0.0.0", port))
+                probe.close()
+                break  # Port is free
+            except OSError:
+                _time.sleep(0.5)
+        else:
+            logger.warning("Port %d still in use after 10s, exec-ing anyway", port)
 
         # Re-exec the process
         os.execv(sys.executable, [sys.executable] + sys.argv)
@@ -1918,10 +1977,31 @@ def create_app() -> tuple[Flask, SocketIO]:
 
 def main():
     """Run the development server."""
+    import socket as _socket
+
     host = os.environ.get("WEB_HOST", "127.0.0.1")
     port = int(os.environ.get("WEB_PORT", "5000"))
     debug = os.environ.get("WEB_DEBUG", "0").lower() in ("1", "true", "yes")
     logger.info("Starting sysadmin-agent web UI on %s:%s", host, port)
+
+    # Patch werkzeug to set SO_REUSEADDR+SO_REUSEPORT so restarts don't
+    # fail with "Address already in use" during TIME_WAIT.
+    try:
+        from werkzeug.serving import BaseWSGIServer
+        _orig_init = BaseWSGIServer.server_bind
+
+        def _patched_bind(self):
+            self.socket.setsockopt(_socket.SOL_SOCKET, _socket.SO_REUSEADDR, 1)
+            try:
+                self.socket.setsockopt(_socket.SOL_SOCKET, _socket.SO_REUSEPORT, 1)
+            except (AttributeError, OSError):
+                pass  # SO_REUSEPORT not available on all platforms
+            return _orig_init(self)
+
+        BaseWSGIServer.server_bind = _patched_bind
+    except Exception:
+        pass
+
     socketio.run(app, host=host, port=port, debug=debug, allow_unsafe_werkzeug=True)
 
 
