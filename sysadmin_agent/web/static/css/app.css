@@ -1179,8 +1179,161 @@ a:hover { text-decoration: underline; }
     flex-wrap: wrap;
 }
 
-/* Diagnostics table for Rust */
+/* Diagnostics table for Rust (legacy) */
 .diag-critical { background: rgba(233, 69, 96, 0.15); }
 .diag-high { background: rgba(233, 69, 96, 0.10); }
 .diag-warning { background: rgba(253, 203, 110, 0.10); }
 .diag-ok { }
+
+/* ===== Diagnostic Report Cards ===== */
+.diag-report { margin: 4px 0; }
+
+.diag-header {
+    padding: 10px 14px;
+    border-radius: 6px 6px 0 0;
+    font-size: 14px;
+    border-bottom: 1px solid var(--border);
+}
+.diag-header-ok { background: rgba(46, 213, 115, 0.12); color: var(--success); }
+.diag-header-warn { background: rgba(233, 69, 96, 0.12); color: var(--danger); }
+
+.diag-summary {
+    padding: 10px 14px;
+    background: var(--bg-secondary);
+    border-left: 3px solid var(--info);
+    font-size: 13px;
+    color: var(--text-primary);
+    white-space: pre-wrap;
+}
+
+.diag-timestamp {
+    padding: 6px 14px;
+    font-size: 11px;
+    color: var(--text-dim);
+}
+
+/* Individual issue cards */
+.diag-card {
+    margin: 6px 0;
+    padding: 10px 14px;
+    border-radius: 6px;
+    border-left: 4px solid var(--border);
+}
+.diag-card-critical { background: rgba(233, 69, 96, 0.12); border-left-color: var(--danger); }
+.diag-card-high { background: rgba(233, 69, 96, 0.08); border-left-color: #e55039; }
+.diag-card-medium { background: rgba(253, 203, 110, 0.10); border-left-color: var(--warning); }
+.diag-card-low { background: rgba(46, 213, 115, 0.06); border-left-color: var(--info); }
+
+.diag-card-title {
+    font-weight: 600;
+    font-size: 13px;
+    margin-bottom: 4px;
+    text-transform: capitalize;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+}
+
+.diag-sev-badge {
+    display: inline-block;
+    padding: 1px 7px;
+    border-radius: 10px;
+    font-size: 10px;
+    font-weight: 700;
+    letter-spacing: 0.04em;
+}
+.diag-sev-critical { background: var(--danger); color: #fff; }
+.diag-sev-high { background: #e55039; color: #fff; }
+.diag-sev-medium { background: var(--warning); color: #1a1a2e; }
+.diag-sev-low { background: var(--border); color: var(--text-secondary); }
+
+.diag-card-details {
+    font-size: 12px;
+    color: var(--text-secondary);
+    margin: 4px 0;
+    white-space: pre-wrap;
+    line-height: 1.5;
+}
+
+.diag-card-reason {
+    font-size: 12px;
+    color: var(--text-primary);
+    margin: 6px 0 2px;
+    padding: 4px 8px;
+    background: rgba(255, 255, 255, 0.04);
+    border-radius: 4px;
+}
+
+.diag-card-fix {
+    font-size: 12px;
+    color: var(--success);
+    margin: 4px 0 2px;
+    padding: 4px 8px;
+    background: rgba(46, 213, 115, 0.06);
+    border-radius: 4px;
+}
+
+/* Fix action buttons */
+.diag-card-fixes {
+    margin-top: 8px;
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    font-size: 12px;
+}
+.diag-card-fixes strong {
+    color: var(--text-dim);
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    margin-bottom: 2px;
+}
+
+.btn-fix {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    padding: 5px 10px;
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    background: var(--bg-primary);
+    color: var(--text-primary);
+    font-size: 12px;
+    cursor: pointer;
+    transition: background 0.15s, border-color 0.15s;
+    text-align: left;
+}
+.btn-fix:hover { background: var(--bg-secondary); border-color: var(--info); }
+.btn-fix code {
+    background: rgba(255, 255, 255, 0.06);
+    padding: 1px 5px;
+    border-radius: 3px;
+    font-size: 11px;
+    color: var(--text-dim);
+}
+
+.btn-fix-destructive { border-color: rgba(233, 69, 96, 0.3); }
+.btn-fix-destructive:hover { border-color: var(--danger); background: rgba(233, 69, 96, 0.08); }
+
+/* Healthy checks collapsible */
+.diag-healthy-section {
+    margin-top: 8px;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+}
+.diag-healthy-summary {
+    padding: 8px 14px;
+    font-size: 12px;
+    color: var(--success);
+    cursor: pointer;
+    user-select: none;
+}
+.diag-healthy-summary:hover { background: rgba(46, 213, 115, 0.05); }
+.diag-healthy-list { padding: 0 14px 8px; }
+.diag-healthy-item {
+    padding: 3px 0;
+    font-size: 12px;
+    color: var(--text-secondary);
+    text-transform: capitalize;
+}
+.diag-check-ok { color: var(--success); font-weight: bold; }
