@@ -130,6 +130,7 @@ class RCONClient:
 
         with self._lock:
             try:
+                self._ws.settimeout(timeout)
                 self._ws.send(payload)
             except Exception as e:
                 self._cleanup_request(req_id)
@@ -255,15 +256,30 @@ class RCONClient:
     def _listen_loop(self):
         """Background thread that reads WebSocket messages and dispatches
         them to the correct waiting command by Identifier."""
+        import websocket as _ws_mod
+
+        # Use a short timeout so we can check _closing periodically,
+        # but don't treat timeouts as connection failures.
         while self._connected and not self._closing:
             try:
+                self._ws.settimeout(5)
                 raw = self._ws.recv()
                 if not raw:
                     continue
-            except Exception:
+            except (TimeoutError, _ws_mod.WebSocketTimeoutException):
+                # No data right now — that's normal, loop back
+                continue
+            except (_ws_mod.WebSocketConnectionClosedException, OSError) as e:
                 if not self._closing:
+                    logger.warning("RCON WebSocket closed: %s", e)
                     self._connected = False
-                    # Wake all waiters
+                    for event in list(self._events.values()):
+                        event.set()
+                break
+            except Exception as e:
+                if not self._closing:
+                    logger.warning("RCON listener error: %s", e)
+                    self._connected = False
                     for event in list(self._events.values()):
                         event.set()
                 break

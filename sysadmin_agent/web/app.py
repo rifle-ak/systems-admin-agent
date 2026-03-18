@@ -1432,10 +1432,26 @@ def handle_rust_connect_pterodactyl(data):
         # Verify connection by listing servers
         servers = ptero.list_servers()
 
-        _ptero_connections[sid] = {"api": ptero, "server_id": server_id}
+        # If user gave a UUID, try to resolve it to the short identifier
+        # that the Client API requires
+        resolved_id = server_id
+        if server_id and "-" in server_id:
+            for s in servers:
+                if s.get("uuid", "").startswith(server_id) or \
+                   s.get("uuid") == server_id:
+                    resolved_id = s["identifier"]
+                    logger.info("Resolved UUID %s to identifier %s",
+                                server_id, resolved_id)
+                    break
+
+        # If no server_id given but only one server exists, auto-select it
+        if not resolved_id and len(servers) == 1:
+            resolved_id = servers[0]["identifier"]
+
+        _ptero_connections[sid] = {"api": ptero, "server_id": resolved_id}
         emit("rust_ptero_connected", {
             "servers": servers,
-            "selected_server": server_id,
+            "selected_server": resolved_id,
         })
     except Exception as exc:
         logger.exception("Pterodactyl connect failed")
