@@ -670,10 +670,14 @@ class RustServerDiagnostics:
     def _read_oxide_log(self, filename):
         """Read an Oxide log file, trying all known directory casings.
 
-        Uses the cached log directory if already discovered.
+        Triggers dynamic directory discovery if the log dir isn't cached yet.
         """
         if not self.ptero or not self.server_id:
             return None
+
+        # Ensure the log directory is discovered first
+        if not self._oxide_log_dir:
+            self._discover_oxide_log_dir()
 
         # Try cached path first
         if self._oxide_log_dir:
@@ -687,8 +691,10 @@ class RustServerDiagnostics:
             except Exception:
                 pass
 
-        # Fall through to trying all paths
+        # Fall through to trying all hardcoded paths
         for log_dir in self._OXIDE_LOG_DIRS:
+            if log_dir == self._oxide_log_dir:
+                continue  # Already tried
             try:
                 content = self.ptero.get_file_contents(
                     self.server_id,
@@ -1123,13 +1129,31 @@ class RustServerDiagnostics:
                 line = line.strip()
                 if not line:
                     continue
-                plugin_count += 1
-                if "loaded" in line.lower():
-                    loaded += 1
-                # Strip quoted plugin name to avoid false positives like "Nav Mesh Error Fix"
-                line_without_name = re.sub(r'"[^"]*"', '""', line)
-                if "error" in line_without_name.lower() or "failed" in line_without_name.lower():
-                    errored += 1
+                ll = line.lower()
+                # Count plugin lines — they typically start with a number or
+                # contain a quoted plugin name like "PluginName"
+                is_plugin_line = bool(
+                    re.match(r'^\d+\s', line) or  # "01 ..."
+                    '"' in line  # Contains quoted plugin name
+                )
+                if is_plugin_line:
+                    plugin_count += 1
+                    # Check for loaded status — may say "loaded", or if it
+                    # doesn't say "error"/"failed"/"unloaded", assume loaded
+                    line_without_name = re.sub(r'"[^"]*"', '""', line)
+                    lln = line_without_name.lower()
+                    if "error" in lln or "failed" in lln:
+                        errored += 1
+                    elif "unloaded" in lln and "not loaded" not in lln:
+                        pass  # Explicitly unloaded
+                    else:
+                        loaded += 1  # No error indicators = loaded
+                elif "loaded" in ll:
+                    # Summary line like "Listing 173 plugins:"
+                    # or "173 plugin(s) loaded"
+                    match = re.search(r'(\d+)\s*plugin', ll)
+                    if match:
+                        loaded = max(loaded, int(match.group(1)))
 
         # Cross-reference with Pterodactyl file listing for accurate count
         disk_plugin_count = 0
@@ -1167,20 +1191,23 @@ class RustServerDiagnostics:
     def check_plugin_errors(self):
         """Check for plugin errors in Oxide logs.
 
-        Scans up to 10 most recent log files (entire content, not just tail)
-        to catch errors across the full uptime period.
+        Discovers the log directory, then scans up to 10 most recent log
+        files (entire content) to catch errors across the full uptime period.
         """
         if not self.ptero or not self.server_id:
             return None
 
         try:
+            # Ensure the log directory is discovered before reading files
+            log_dir = self._discover_oxide_log_dir()
+
             log_files = self.ptero.rust_get_oxide_logs(self.server_id, limit=15)
             if not log_files:
                 return {
                     "name": "check_plugin_errors",
                     "status": "info",
                     "severity": "low",
-                    "details": "No Oxide log files found. Checked oxide/logs and Oxide/Logs paths.",
+                    "details": f"No Oxide log files found. Log dir: {log_dir or 'not discovered'}",
                     "fix": None,
                     "category": "plugins",
                 }
@@ -1188,7 +1215,7 @@ class RustServerDiagnostics:
             errors = []
             files_scanned = 0
             total_lines = 0
-            for log_file in log_files[:10]:  # Scan last 10 log files
+            for log_file in log_files[:10]:
                 content = self._read_oxide_log(log_file["name"])
                 if not content:
                     continue
@@ -1196,9 +1223,13 @@ class RustServerDiagnostics:
                 lines = content.splitlines()
                 total_lines += len(lines)
                 for line in lines:
-                    if any(kw in line.lower() for kw in
+                    ll = line.lower()
+                    # Only match actual error indicators, skip [Info] lines
+                    if "[info]" in ll:
+                        continue
+                    if any(kw in ll for kw in
                            ("error", "exception", "nullref", "failed to",
-                            "unloaded", "compilation failed")):
+                            "unloaded", "compilation failed", "stacktrace")):
                         errors.append({
                             "file": log_file["name"],
                             "line": line.strip()[:200],
@@ -1207,7 +1238,6 @@ class RustServerDiagnostics:
             scan_info = f"Scanned {files_scanned} log file(s), {total_lines:,} lines"
 
             if errors:
-                # Deduplicate by line content, keep source info
                 seen = {}
                 for e in errors:
                     key = e["line"]
@@ -1608,10 +1638,18 @@ class RustServerDiagnostics:
         crash_indicators = []
         sources_checked = []
 
-        crash_keywords = ("crash", "segfault", "oom", "out of memory",
-                          "fatal", "unhandled exception", "stack overflow",
-                          "access violation", "killed", "terminated",
-                          "aborted", "sigsegv", "sigkill")
+        # Use specific phrases to avoid false positives from game events.
+        # "oom" matches "mushroom", "crash" matches "crashsite" monument,
+        # so we use multi-word phrases or regex patterns instead.
+        crash_keywords = (
+            "crashed", "crashing",  # past/present tense avoids "crashsite"
+            "segfault", "sigsegv", "sigkill", "sigabrt",
+            "out of memory", "system.outofmemoryexception",
+            "unhandled exception", "stack overflow",
+            "access violation", "fatal error",
+            "application crash", "server crash",
+            "oom kill", "oom-kill", "oom_kill",
+        )
 
         # 1. Check for crash files in /server/rust
         try:
@@ -1753,12 +1791,80 @@ class RustServerDiagnostics:
         except Exception:
             return None
 
+    def _discover_all_log_sources(self):
+        """Scan the container file system for ALL log directories and files.
+
+        Walks the top two directory levels looking for directories named
+        'logs', 'log', or files ending in .log/.txt that look like logs.
+        Returns a list of (display_name, full_path, is_dir) tuples.
+        """
+        if not self.ptero or not self.server_id:
+            return []
+
+        sources = []
+        seen_paths = set()
+
+        search_roots = ["/", "/server/rust", "/home/container", "/server"]
+        log_dir_names = {"logs", "log"}
+
+        for root in search_roots:
+            try:
+                entries = self.ptero.list_files(self.server_id, root)
+            except Exception:
+                continue
+
+            for entry in entries:
+                name = entry["name"]
+                name_lower = name.lower()
+                full_path = f"{root}/{name}" if root != "/" else f"/{name}"
+
+                if full_path in seen_paths:
+                    continue
+                seen_paths.add(full_path)
+
+                if entry["is_file"]:
+                    # Log-like files at the root level
+                    if (name_lower.endswith(".log") or
+                        name_lower.endswith(".txt") and
+                        ("log" in name_lower or "crash" in name_lower or
+                         "error" in name_lower or "output" in name_lower)):
+                        sources.append((name, full_path, False))
+                else:
+                    # Check if this is a logs directory
+                    if name_lower in log_dir_names:
+                        sources.append((f"{root}/{name}", full_path, True))
+                    else:
+                        # Recurse one level into subdirectories to find logs/
+                        try:
+                            sub_entries = self.ptero.list_files(
+                                self.server_id, full_path)
+                            for sub in sub_entries:
+                                sub_name = sub["name"]
+                                sub_lower = sub["name"].lower()
+                                sub_path = f"{full_path}/{sub_name}"
+                                if sub_path in seen_paths:
+                                    continue
+                                seen_paths.add(sub_path)
+
+                                if not sub["is_file"] and sub_lower in log_dir_names:
+                                    sources.append((
+                                        f"{name}/{sub_name}", sub_path, True))
+                                elif sub["is_file"] and (
+                                    sub_lower.endswith(".log") or
+                                    (sub_lower.endswith(".txt") and
+                                     "log" in sub_lower)):
+                                    sources.append((
+                                        f"{name}/{sub_name}", sub_path, False))
+                        except Exception:
+                            continue
+
+        return sources
+
     def check_server_logs(self):
         """Comprehensive scan of ALL available server logs.
 
-        Reads full content (not just tail) of up to 10 Oxide log files,
-        5 Steam log files, and console output. Reports scan coverage
-        so the user knows exactly what was checked.
+        Discovers all log directories and files across the entire container,
+        not just known paths. Reads full content and classifies each line.
         """
         if not self.ptero or not self.server_id:
             return None
@@ -1769,19 +1875,53 @@ class RustServerDiagnostics:
         total_files = 0
 
         # Keywords that indicate real problems (not just informational)
+        # For Oxide logs: skip [Info] lines, only match [Error]/[Warning] or
+        # lines with clear error indicators
         error_keywords = (
-            "error", "exception", "nullref", "failed to", "crash",
-            "fatal", "stack overflow", "out of memory", "oom",
-            "timeout", "timed out", "access violation", "segfault",
-            "compilation failed", "unloaded",
+            "exception", "nullref", "nullreferenceexception",
+            "failed to compile", "compilation failed",
+            "stacktrace", "stack overflow", "out of memory",
+            "access violation", "segfault",
+        )
+        # For non-Oxide logs (Steam, console): broader matching is ok
+        broad_error_keywords = (
+            "error", "exception", "failed", "crashed", "fatal",
+            "timeout", "timed out",
         )
         warning_keywords = (
-            "warning", "deprecated", "slow", "lag",
-            "took too long", "performance",
+            "warning", "deprecated",
         )
+
+        def _classify_oxide_line(line):
+            """Classify an Oxide log line as error/warning/None."""
+            ll = line.lower()
+            # Oxide log format: [Oxide] HH:MM [Level] message
+            # or: [PluginName] message
+            if "[error]" in ll:
+                return "error"
+            if "[warning]" in ll or "[warn]" in ll:
+                return "warning"
+            # Skip [Info] lines entirely — they're not problems
+            if "[info]" in ll:
+                return None
+            # Check for error indicators in non-tagged lines
+            if any(kw in ll for kw in error_keywords):
+                return "error"
+            return None
+
+        def _classify_general_line(line):
+            """Classify a non-Oxide log line (Steam, console)."""
+            ll = line.lower()
+            if any(kw in ll for kw in broad_error_keywords):
+                return "error"
+            if any(kw in ll for kw in warning_keywords):
+                return "warning"
+            return None
 
         # 1. Scan Oxide logs — full content, up to 10 files
         try:
+            # Ensure log dir is discovered
+            self._discover_oxide_log_dir()
             log_files = self.ptero.rust_get_oxide_logs(self.server_id, limit=15)
             if log_files:
                 oxide_files_read = 0
@@ -1794,17 +1934,11 @@ class RustServerDiagnostics:
                     lines = content.splitlines()
                     total_lines += len(lines)
                     for line in lines:
-                        ll = line.lower()
-                        if any(kw in ll for kw in error_keywords):
+                        level = _classify_oxide_line(line)
+                        if level:
                             issues.append({
                                 "source": f"Oxide/{log_file['name']}",
-                                "level": "error",
-                                "line": line.strip()[:200],
-                            })
-                        elif any(kw in ll for kw in warning_keywords):
-                            issues.append({
-                                "source": f"Oxide/{log_file['name']}",
-                                "level": "warning",
+                                "level": level,
                                 "line": line.strip()[:200],
                             })
                 if oxide_files_read:
@@ -1825,11 +1959,11 @@ class RustServerDiagnostics:
                     lines = content.splitlines()
                     total_lines += len(lines)
                     for line in lines:
-                        ll = line.lower()
-                        if any(kw in ll for kw in error_keywords):
+                        level = _classify_general_line(line)
+                        if level:
                             issues.append({
                                 "source": f"Steam/{fname}",
-                                "level": "error",
+                                "level": level,
                                 "line": line.strip()[:200],
                             })
         except Exception:
@@ -1845,19 +1979,94 @@ class RustServerDiagnostics:
                     lines = content.splitlines()
                     total_lines += len(lines)
                     for line in lines:
-                        ll = line.lower()
-                        if any(kw in ll for kw in error_keywords):
+                        # Console output mixes Oxide and engine output;
+                        # use Oxide classifier for Oxide-tagged lines
+                        if "[oxide]" in line.lower() or re.match(r'\[.*\]\s', line):
+                            level = _classify_oxide_line(line)
+                        else:
+                            level = _classify_general_line(line)
+                        if level:
                             issues.append({
                                 "source": fname,
-                                "level": "error",
+                                "level": level,
                                 "line": line.strip()[:200],
                             })
-                        elif any(kw in ll for kw in warning_keywords):
-                            issues.append({
-                                "source": fname,
-                                "level": "warning",
-                                "line": line.strip()[:200],
-                            })
+        except Exception:
+            pass
+
+        # 4. Broad discovery — find any log dirs/files we missed above
+        try:
+            all_sources = self._discover_all_log_sources()
+            already_scanned = set()
+            for src_name in sources_checked:
+                already_scanned.add(src_name.lower())
+
+            for display_name, full_path, is_dir in all_sources:
+                # Skip sources we already scanned
+                if any(s.lower() in display_name.lower() for s in
+                       ("oxide", "steam", "output_log", "server_console",
+                        "Log.EAC", "latest.log")):
+                    # Already covered by sections 1-3
+                    if any(display_name.lower() in s.lower()
+                           for s in sources_checked):
+                        continue
+
+                if is_dir:
+                    # Read files from this log directory
+                    try:
+                        dir_files = self.ptero.list_files(
+                            self.server_id, full_path)
+                        log_entries = sorted(
+                            [f for f in dir_files if f["is_file"]],
+                            key=lambda f: f.get("modified_at", ""),
+                            reverse=True,
+                        )
+                        dir_files_read = 0
+                        for lf in log_entries[:5]:
+                            try:
+                                content = self.ptero.get_file_contents(
+                                    self.server_id,
+                                    f"{full_path}/{lf['name']}")
+                                if content:
+                                    dir_files_read += 1
+                                    total_files += 1
+                                    lines = content.splitlines()
+                                    total_lines += len(lines)
+                                    for line in lines:
+                                        level = _classify_general_line(line)
+                                        if level:
+                                            issues.append({
+                                                "source": f"{display_name}/{lf['name']}",
+                                                "level": level,
+                                                "line": line.strip()[:200],
+                                            })
+                            except Exception:
+                                continue
+                        if dir_files_read:
+                            sources_checked.append(
+                                f"{display_name} ({dir_files_read} files)")
+                    except Exception:
+                        continue
+                else:
+                    # Single file
+                    try:
+                        content = self.ptero.get_file_contents(
+                            self.server_id, full_path)
+                        if content:
+                            total_files += 1
+                            lines = content.splitlines()
+                            total_lines += len(lines)
+                            sources_checked.append(display_name)
+                            for line in lines:
+                                level = _classify_general_line(line)
+                                if level:
+                                    issues.append({
+                                        "source": display_name,
+                                        "level": level,
+                                        "line": line.strip()[:200],
+                                    })
+                    except Exception:
+                        continue
         except Exception:
             pass
 
