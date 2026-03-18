@@ -569,17 +569,29 @@ def save_profile():
 
     # Handle Rust admin credentials (RCON + Pterodactyl)
     import base64 as _b64
+
+    # Get existing profile for preserving saved secrets
+    existing_profile = server_profiles.get(name, {})
+
     if data.get("rcon_password"):
         profile_data["rcon_password_obf"] = _b64.b64encode(
             data["rcon_password"].encode("utf-8")
         ).decode("ascii")
         profile_data.pop("rcon_password", None)
+    elif data.get("preserve_rcon_password") and existing_profile.get("rcon_password_obf"):
+        # Keep the existing saved RCON password
+        profile_data["rcon_password_obf"] = existing_profile["rcon_password_obf"]
+    profile_data.pop("preserve_rcon_password", None)
 
     if data.get("ptero_api_key"):
         profile_data["ptero_api_key_obf"] = _b64.b64encode(
             data["ptero_api_key"].encode("utf-8")
         ).decode("ascii")
         profile_data.pop("ptero_api_key", None)
+    elif data.get("preserve_ptero_api_key") and existing_profile.get("ptero_api_key_obf"):
+        # Keep the existing saved Pterodactyl API key
+        profile_data["ptero_api_key_obf"] = existing_profile["ptero_api_key_obf"]
+    profile_data.pop("preserve_ptero_api_key", None)
 
     server_profiles[name] = profile_data
     _save_config(server_profiles)
@@ -1546,7 +1558,18 @@ def handle_rust_connect_pterodactyl(data):
         if not resolved_id and len(servers) == 1:
             resolved_id = servers[0]["identifier"]
 
-        _ptero_connections[sid] = {"api": ptero, "server_id": resolved_id}
+        # Store server limits (CPU, memory) for diagnostics
+        server_limits = {}
+        for s in servers:
+            if s.get("identifier") == resolved_id:
+                server_limits = s.get("limits", {})
+                break
+
+        _ptero_connections[sid] = {
+            "api": ptero,
+            "server_id": resolved_id,
+            "limits": server_limits,
+        }
 
         result = {
             "servers": servers,
@@ -1661,8 +1684,10 @@ def handle_rust_run_diagnostics(data=None):
         def progress_cb(msg):
             emit("status", {"message": msg})
 
+        server_limits = ptero_data.get("limits", {}) if ptero_data else {}
         diag = RustServerDiagnostics(rcon, ptero=ptero, server_id=server_id,
-                                     ssh=ssh, on_progress=progress_cb)
+                                     ssh=ssh, on_progress=progress_cb,
+                                     server_limits=server_limits)
         results = diag.run_all()
 
         emit("rust_diagnostics_result", {"diagnostics": results})
@@ -1694,8 +1719,10 @@ def handle_rust_diagnose_lag(data=None):
         def progress_cb(msg):
             emit("status", {"message": msg})
 
+        server_limits = ptero_data.get("limits", {}) if ptero_data else {}
         diag = RustServerDiagnostics(rcon, ptero=ptero, server_id=server_id,
-                                     ssh=ssh, on_progress=progress_cb)
+                                     ssh=ssh, on_progress=progress_cb,
+                                     server_limits=server_limits)
         results = diag.run_lag_diagnosis()
 
         emit("rust_lag_result", {"diagnosis": results})
@@ -1727,7 +1754,9 @@ def handle_rust_plugin_action(data):
 
         ptero = ptero_data["api"] if ptero_data else None
         server_id = ptero_data.get("server_id") if ptero_data else None
-        diag = RustServerDiagnostics(rcon, ptero=ptero, server_id=server_id)
+        server_limits = ptero_data.get("limits", {}) if ptero_data else {}
+        diag = RustServerDiagnostics(rcon, ptero=ptero, server_id=server_id,
+                                     server_limits=server_limits)
 
         if action == "reload":
             result = diag.reload_plugin(plugin_name)
