@@ -1189,7 +1189,20 @@ def handle_ask_agent(data):
 
     except Exception as exc:
         logger.exception("ask_agent failed")
-        emit("error", {"message": f"Agent error: {exc}"})
+        # Give the user a friendly message for known API errors
+        msg = str(exc)
+        exc_type = type(exc).__name__
+        if "OverloadedError" in exc_type or "529" in msg:
+            msg = ("The AI model is currently overloaded. "
+                   "Please wait a moment and try again, or switch to a different model.")
+        elif "RateLimitError" in exc_type or "429" in msg:
+            msg = ("API rate limit reached. Please wait a minute before trying again.")
+        elif "AuthenticationError" in exc_type or "401" in msg:
+            msg = ("API key is invalid or expired. Check your ANTHROPIC_API_KEY in settings.")
+        elif "NotFoundError" in exc_type or "404" in msg:
+            msg = (f"Model not found. The selected model may not be available on your API plan. "
+                   f"Try switching to a different model.")
+        emit("error", {"message": msg})
 
 
 @socketio.on("approve_action")
