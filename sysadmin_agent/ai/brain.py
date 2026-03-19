@@ -1,6 +1,11 @@
 import json
+import logging
 import os
-from anthropic import Anthropic
+import time
+
+from anthropic import Anthropic, APIStatusError
+
+logger = logging.getLogger(__name__)
 
 
 SYSTEM_PROMPT = """You are a systems administration expert agent. Your job is to interpret requests and produce actionable plans.
@@ -182,6 +187,28 @@ class AgentBrain:
             except Exception:
                 pass
 
+    def _api_call_with_retry(self, create_kwargs, max_retries=3):
+        """Call messages.create with retries for transient errors (529, 429, 500)."""
+        last_error = None
+        for attempt in range(max_retries + 1):
+            try:
+                response = self.client.messages.create(**create_kwargs)
+                self._track_usage(response.usage)
+                return response
+            except APIStatusError as e:
+                last_error = e
+                # Retry on overloaded (529), rate limit (429), server error (500+)
+                if e.status_code in (529, 429, 500, 502, 503) and attempt < max_retries:
+                    backoff = (2 ** attempt) + 1  # 2s, 3s, 5s
+                    logger.warning(
+                        "Anthropic API error %d (attempt %d/%d): %s — retrying in %ds",
+                        e.status_code, attempt + 1, max_retries + 1,
+                        e.message, backoff,
+                    )
+                    time.sleep(backoff)
+                else:
+                    raise
+
     def _parse_json_response(self, text):
         text = text.strip()
         if text.startswith("```"):
@@ -200,13 +227,12 @@ class AgentBrain:
                 ctx_lines.append(f"- {key}: {value}")
             user_message += "\n\nServer context:\n" + "\n".join(ctx_lines)
 
-        response = self.client.messages.create(
-            model=self.model,
-            max_tokens=4096,
-            system=SYSTEM_PROMPT,
-            messages=[{"role": "user", "content": user_message}],
-        )
-        self._track_usage(response.usage)
+        response = self._api_call_with_retry({
+            "model": self.model,
+            "max_tokens": 4096,
+            "system": SYSTEM_PROMPT,
+            "messages": [{"role": "user", "content": user_message}],
+        })
 
         text = response.content[0].text
         return self._parse_json_response(text)
@@ -224,13 +250,12 @@ class AgentBrain:
             parts.append(f"Context: {json.dumps(context)}")
         user_message = "\n\n".join(parts)
 
-        response = self.client.messages.create(
-            model=self.model,
-            max_tokens=2048,
-            system=ANALYSIS_SYSTEM_PROMPT,
-            messages=[{"role": "user", "content": user_message}],
-        )
-        self._track_usage(response.usage)
+        response = self._api_call_with_retry({
+            "model": self.model,
+            "max_tokens": 2048,
+            "system": ANALYSIS_SYSTEM_PROMPT,
+            "messages": [{"role": "user", "content": user_message}],
+        })
 
         text = response.content[0].text
         return self._parse_json_response(text)
