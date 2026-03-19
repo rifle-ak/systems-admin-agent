@@ -356,9 +356,31 @@ def _build_server_context(sid: str) -> dict:
         panels = [p.get("name", "") for p in apps.get("control_panels", [])]
         if panels:
             ctx["control_panels"] = ", ".join(panels)
-        cms = [c.get("name", "") for c in apps.get("cms", [])]
+        cms_items = apps.get("cms", [])
+        cms = [c.get("name", "") for c in cms_items]
         if cms:
             ctx["cms"] = ", ".join(cms)
+
+        # Build a detailed site map for WordPress installations so the AI
+        # knows which domain lives at which path and where to find logs.
+        site_map_entries = []
+        for c in cms_items:
+            if c.get("name") != "WordPress":
+                continue
+            parts = []
+            domain = c.get("domain")
+            path = c.get("path", "")
+            if domain:
+                parts.append(f"domain={domain}")
+            parts.append(f"path={path}")
+            parts.append(f"version={c.get('version', '?')}")
+            error_logs = c.get("error_logs")
+            if error_logs:
+                log_strs = [f"{k}={v}" for k, v in error_logs.items()]
+                parts.append("logs: " + ", ".join(log_strs))
+            site_map_entries.append(" | ".join(parts))
+        if site_map_entries:
+            ctx["wordpress_sites"] = "\n".join(site_map_entries)
         langs = [l.get("name", "") for l in apps.get("languages", [])]
         if langs:
             ctx["languages"] = ", ".join(langs)

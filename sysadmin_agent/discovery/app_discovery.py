@@ -48,6 +48,178 @@ class AppDiscovery:
             return {"name": name, "version": version_line.strip(), "installed": True}
         return None
 
+    def _resolve_wp_domain(self, wp_dir):
+        """Resolve the domain name for a WordPress installation.
+
+        Tries multiple strategies:
+        1. wp-cli option get siteurl (most reliable)
+        2. Parse WP_SITEURL / WP_HOME from wp-config.php
+        3. Match web server vhost configs pointing at this document root
+        4. Infer from cPanel-style path (/home/USER/public_html -> main domain)
+        """
+        domain = None
+
+        # Strategy 1: wp-cli (fast, authoritative)
+        wp_result = self._run(
+            f"wp option get siteurl --path={wp_dir} --skip-themes --skip-plugins 2>/dev/null",
+            timeout=10,
+        )
+        if wp_result["exit_code"] == 0 and wp_result["stdout"].strip():
+            url = wp_result["stdout"].strip()
+            domain = re.sub(r'^https?://', '', url).split('/')[0]
+            if domain:
+                return domain
+
+        # Strategy 2: Parse wp-config.php for hardcoded URL
+        config_result = self._run(
+            f"grep -E \"WP_SITEURL|WP_HOME\" {wp_dir}/wp-config.php 2>/dev/null | head -2"
+        )
+        if config_result["exit_code"] == 0 and config_result["stdout"].strip():
+            for line in config_result["stdout"].strip().splitlines():
+                match = re.search(r"https?://([^'\"/:]+)", line)
+                if match:
+                    domain = match.group(1)
+                    return domain
+
+        # Strategy 3: Match Apache/Nginx vhost document root to this path
+        vhost_result = self._run(
+            f"grep -rl '{re.escape(wp_dir)}' "
+            "/etc/apache2/sites-enabled/ /etc/httpd/conf.d/ "
+            "/etc/nginx/sites-enabled/ /etc/nginx/conf.d/ "
+            "/usr/local/apache/conf/httpd.conf "
+            "2>/dev/null | head -3"
+        )
+        if vhost_result["exit_code"] == 0 and vhost_result["stdout"].strip():
+            for vhost_file in vhost_result["stdout"].strip().splitlines():
+                vhost_content = self._run(f"cat {vhost_file} 2>/dev/null")
+                if vhost_content["exit_code"] == 0:
+                    # Extract ServerName (Apache) or server_name (Nginx)
+                    sn_match = re.search(
+                        r'(?:ServerName|server_name)\s+([^\s;]+)',
+                        vhost_content["stdout"], re.IGNORECASE,
+                    )
+                    if sn_match:
+                        domain = sn_match.group(1).strip()
+                        return domain
+
+        # Strategy 4: cPanel path inference (/home/USER/public_html -> main domain)
+        cpanel_match = re.match(r'/home/([^/]+)/public_html(?:/(.+))?$', wp_dir)
+        if cpanel_match:
+            user = cpanel_match.group(1)
+            subdomain_path = cpanel_match.group(2)
+
+            if subdomain_path:
+                # Subdomain/addon domain — check cPanel userdata
+                userdata = self._run(
+                    f"cat /var/cpanel/userdata/{user}/* 2>/dev/null | "
+                    f"grep -B5 '{re.escape(wp_dir)}' | grep 'ServerName\\|servername' | head -1"
+                )
+                if userdata["exit_code"] == 0 and userdata["stdout"].strip():
+                    sn_match = re.search(r'(?:ServerName|servername):\s*(\S+)', userdata["stdout"])
+                    if sn_match:
+                        return sn_match.group(1)
+            else:
+                # Main public_html — get domain from cPanel user config
+                main_domain = self._run(
+                    f"grep '^DNS=' /var/cpanel/users/{user} 2>/dev/null | head -1 | cut -d= -f2"
+                )
+                if main_domain["exit_code"] == 0 and main_domain["stdout"].strip():
+                    return main_domain["stdout"].strip()
+
+        return domain
+
+    def _find_site_error_logs(self, site_path, domain=None):
+        """Find error log paths relevant to a specific site.
+
+        Checks:
+        1. WordPress debug.log
+        2. PHP error log configured for the site
+        3. Apache/Nginx vhost-specific error logs
+        4. cPanel per-domain logs
+        """
+        logs = {}
+
+        # 1. WordPress debug.log
+        debug_log = f"{site_path}/wp-content/debug.log"
+        result = self._run(f"test -f {debug_log} && echo 'exists'")
+        if result["stdout"].strip() == "exists":
+            logs["wp_debug_log"] = debug_log
+
+        # 2. PHP error log from wp-config.php or ini
+        php_log = self._run(
+            f"grep -i 'ini_set.*error_log\\|WP_DEBUG_LOG' {site_path}/wp-config.php 2>/dev/null | head -2"
+        )
+        if php_log["exit_code"] == 0 and php_log["stdout"].strip():
+            for line in php_log["stdout"].strip().splitlines():
+                path_match = re.search(r"['\"](/[^'\"]+)['\"]", line)
+                if path_match and "log" in path_match.group(1).lower():
+                    candidate = path_match.group(1)
+                    exists = self._run(f"test -f {candidate} && echo 'exists'")
+                    if exists["stdout"].strip() == "exists":
+                        logs["php_error_log"] = candidate
+
+        # 3. Web server vhost error logs
+        if domain:
+            # Apache error logs
+            apache_log_result = self._run(
+                f"grep -rh 'ErrorLog' "
+                f"/etc/apache2/sites-enabled/ /etc/httpd/conf.d/ "
+                f"/usr/local/apache/conf/httpd.conf 2>/dev/null | "
+                f"grep -i '{re.escape(domain)}' | head -1"
+            )
+            if apache_log_result["exit_code"] == 0 and apache_log_result["stdout"].strip():
+                path_match = re.search(r'ErrorLog\s+(\S+)', apache_log_result["stdout"])
+                if path_match:
+                    log_path = path_match.group(1).strip('"')
+                    logs["apache_error_log"] = log_path
+
+            # Nginx error logs
+            nginx_log_result = self._run(
+                f"grep -rh 'error_log' "
+                f"/etc/nginx/sites-enabled/ /etc/nginx/conf.d/ 2>/dev/null | "
+                f"grep -i '{re.escape(domain)}' | head -1"
+            )
+            if nginx_log_result["exit_code"] == 0 and nginx_log_result["stdout"].strip():
+                path_match = re.search(r'error_log\s+(\S+)', nginx_log_result["stdout"])
+                if path_match:
+                    log_path = path_match.group(1).strip(';').strip('"')
+                    logs["nginx_error_log"] = log_path
+
+        # 4. cPanel per-user logs
+        cpanel_match = re.match(r'/home/([^/]+)/', site_path)
+        if cpanel_match:
+            user = cpanel_match.group(1)
+            cpanel_paths = [
+                f"/home/{user}/logs/error.log",
+                f"/var/log/apache2/domlogs/{user}/",
+                f"/usr/local/apache/domlogs/{user}/",
+            ]
+            if domain:
+                cpanel_paths.insert(0, f"/home/{user}/logs/{domain}.error.log")
+                cpanel_paths.insert(1, f"/var/log/apache2/domlogs/{user}/{domain}-error_log")
+
+            for p in cpanel_paths:
+                exists = self._run(f"test -e {p} && echo 'exists'")
+                if exists["stdout"].strip() == "exists":
+                    logs["cpanel_error_log"] = p
+                    break
+
+        # 5. Generic fallback: look near the site path
+        if not logs.get("apache_error_log") and not logs.get("nginx_error_log"):
+            # Common global error log locations
+            for candidate in [
+                "/var/log/apache2/error.log",
+                "/var/log/httpd/error_log",
+                "/var/log/nginx/error.log",
+                "/usr/local/apache/logs/error_log",
+            ]:
+                exists = self._run(f"test -f {candidate} && echo 'exists'")
+                if exists["stdout"].strip() == "exists":
+                    logs["server_error_log"] = candidate
+                    break
+
+        return logs if logs else None
+
     def _discover_system_services(self):
         services = []
 
@@ -166,7 +338,19 @@ class AppDiscovery:
                     match = re.search(r"'([^']+)'", ver_result["stdout"])
                     if match:
                         version = match.group(1)
-                cms_list.append({"name": "WordPress", "version": version, "path": wp_dir})
+                entry = {"name": "WordPress", "version": version, "path": wp_dir}
+
+                # Resolve domain via wp-cli or wp-config.php
+                domain = self._resolve_wp_domain(wp_dir)
+                if domain:
+                    entry["domain"] = domain
+
+                # Map error log paths for this site
+                error_logs = self._find_site_error_logs(wp_dir, domain)
+                if error_logs:
+                    entry["error_logs"] = error_logs
+
+                cms_list.append(entry)
 
         # Joomla
         joomla_result = self._run(
