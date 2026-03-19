@@ -319,6 +319,12 @@ def _build_server_context(sid: str) -> dict:
     data = _get_session_data(sid)
     ctx: dict = {}
 
+    # Tell the AI which user we're SSH'd in as — critical for knowing
+    # whether commands like wp-cli need sudo -u <site_owner>.
+    ssh_user = data.get("username")
+    if ssh_user:
+        ctx["ssh_user"] = ssh_user
+
     os_info = data.get("os_info")
     if os_info:
         ctx["os"] = (
@@ -1107,6 +1113,13 @@ def handle_ask_agent(data):
                 })
                 continue
 
+            # Ensure SSH is alive before executing — the connection may
+            # have dropped during API retry backoff or long analysis.
+            try:
+                ssh._ensure_connected()
+            except Exception:
+                logger.warning("SSH reconnect before step %s", step["step"])
+
             emit("step_executing", {
                 "step": step["step"],
                 "description": step["description"],
@@ -1162,6 +1175,30 @@ def handle_ask_agent(data):
                 result = ssh.execute_sudo(command)
             else:
                 result = ssh.execute(command)
+
+            # Auto-fix wp-cli "running as root" failures: detect the error
+            # and retry with sudo -u <site_owner> instead of failing.
+            if (result["exit_code"] != 0
+                    and "running this as root" in result.get("stderr", "")):
+                # Extract site owner from --path=/home/<user>/...
+                import re as _re
+                _path_match = _re.search(
+                    r'--path=/home/([^/\s]+)', command
+                )
+                if _path_match:
+                    _site_owner = _path_match.group(1)
+                    _fixed_cmd = f"sudo -u {_site_owner} {command}"
+                    logger.info(
+                        "wp-cli root error detected, retrying as user %s",
+                        _site_owner,
+                    )
+                    emit("step_executing", {
+                        "step": step["step"],
+                        "description": f"(auto-fix) Re-running as {_site_owner}",
+                        "command": _fixed_cmd,
+                    })
+                    result = ssh.execute(_fixed_cmd)
+                    command = _fixed_cmd  # use fixed command for analysis
 
             # AI analysis of the output
             analysis = brain.analyze_results(
