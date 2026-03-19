@@ -10,7 +10,7 @@ class SSHManager:
     # Keep well under the SSH server's channel limit to avoid rejections.
     MAX_CONCURRENT_CHANNELS = 5
     # Number of times to retry an operation after reconnecting
-    MAX_RETRIES = 2
+    MAX_RETRIES = 3
 
     def __init__(self, host, port=22, username=None, password=None,
                  private_key_path=None, passphrase=None, timeout=15):
@@ -105,11 +105,13 @@ class SSHManager:
                         "stderr": stderr.read().decode("utf-8", errors="replace"),
                         "exit_code": exit_code,
                     }
-            except (OSError, paramiko.SSHException, paramiko.ChannelException) as e:
+            except (OSError, paramiko.SSHException, paramiko.ChannelException,
+                    EOFError, ConnectionResetError) as e:
                 if attempt < self.MAX_RETRIES:
+                    backoff = 2 ** attempt  # 1s, 2s
                     logger.warning(
-                        "SSH execute failed (attempt %d/%d): %s — reconnecting",
-                        attempt + 1, self.MAX_RETRIES + 1, e,
+                        "SSH execute failed (attempt %d/%d): %s — reconnecting in %ds",
+                        attempt + 1, self.MAX_RETRIES + 1, e, backoff,
                     )
                     # Force reconnect on next _ensure_connected
                     if self._client:
@@ -118,7 +120,7 @@ class SSHManager:
                         except Exception:
                             pass
                         self._client = None
-                    time.sleep(1)
+                    time.sleep(backoff)
                 else:
                     raise
 
@@ -127,7 +129,9 @@ class SSHManager:
         if not self.password:
             raise ValueError("Password is required for sudo commands")
 
+        last_error = None
         for attempt in range(self.MAX_RETRIES + 1):
+            channel = None
             try:
                 self._ensure_connected()
                 with self._channel_semaphore:
@@ -140,9 +144,20 @@ class SSHManager:
                     channel.settimeout(30)
                     channel.exec_command(f"sudo -S -p '' {command}")
 
-                    # Wait briefly for the password prompt, then send password
-                    time.sleep(0.5)
-                    channel.send(self.password + "\n")
+                    # Wait for the channel to be ready for sending, then
+                    # send the password.  Use a short recv loop instead of
+                    # a blind sleep so we notice a dead socket immediately.
+                    send_deadline = time.monotonic() + 3
+                    while time.monotonic() < send_deadline:
+                        if channel.recv_ready():
+                            # Consume the (empty) password prompt
+                            channel.recv(4096)
+                            break
+                        # Check the channel is still alive
+                        if channel.closed or not transport.is_active():
+                            raise paramiko.SSHException("Channel died before password send")
+                        time.sleep(0.1)
+                    channel.sendall((self.password + "\n").encode("utf-8"))
 
                     # Read output after command completes
                     stdout_chunks = []
@@ -177,19 +192,29 @@ class SSHManager:
                         "stderr": b"".join(stderr_chunks).decode("utf-8", errors="replace"),
                         "exit_code": exit_code,
                     }
-            except (OSError, paramiko.SSHException, paramiko.ChannelException) as e:
+            except (OSError, paramiko.SSHException, paramiko.ChannelException,
+                    EOFError, ConnectionResetError) as e:
+                last_error = e
+                # Make sure the channel is cleaned up
+                if channel:
+                    try:
+                        channel.close()
+                    except Exception:
+                        pass
                 if attempt < self.MAX_RETRIES:
+                    backoff = 2 ** attempt  # 1s, 2s
                     logger.warning(
-                        "SSH execute_sudo failed (attempt %d/%d): %s — reconnecting",
-                        attempt + 1, self.MAX_RETRIES + 1, e,
+                        "SSH execute_sudo failed (attempt %d/%d): %s — reconnecting in %ds",
+                        attempt + 1, self.MAX_RETRIES + 1, e, backoff,
                     )
+                    # Force full reconnect
                     if self._client:
                         try:
                             self._client.close()
                         except Exception:
                             pass
                         self._client = None
-                    time.sleep(1)
+                    time.sleep(backoff)
                 else:
                     raise
 

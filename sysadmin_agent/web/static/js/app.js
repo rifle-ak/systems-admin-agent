@@ -287,19 +287,57 @@ function updateProgress(text) {
 
 // ---------- Render Helpers ----------
 
-function renderCodeBlock(text, exitCode = null) {
+function renderCodeBlock(text, exitCode = null, label = '') {
+    const MAX_PREVIEW_LINES = 6;
+    const raw = text || '(no output)';
+    const lines = raw.split('\n');
+    const isLong = lines.length > MAX_PREVIEW_LINES;
+
     const block = document.createElement('div');
-    block.className = 'code-block';
+    block.className = 'code-block' + (exitCode !== null && exitCode !== 0 ? ' code-block-error' : '');
+
+    // Header bar with label + exit code
+    if (label || (exitCode !== null && exitCode !== undefined)) {
+        const header = document.createElement('div');
+        header.className = 'code-block-header';
+        if (label) {
+            const lbl = document.createElement('span');
+            lbl.className = 'code-block-label';
+            lbl.textContent = label;
+            header.appendChild(lbl);
+        }
+        if (exitCode !== null && exitCode !== undefined) {
+            const exitEl = document.createElement('span');
+            exitEl.className = 'exit-code ' + (exitCode === 0 ? 'success' : 'error');
+            exitEl.textContent = exitCode === 0 ? 'OK' : `exit ${exitCode}`;
+            header.appendChild(exitEl);
+        }
+        block.appendChild(header);
+    }
 
     const code = document.createElement('code');
-    code.textContent = text || '(no output)';
-    block.appendChild(code);
+    if (isLong) {
+        code.textContent = lines.slice(0, MAX_PREVIEW_LINES).join('\n');
+        block.appendChild(code);
 
-    if (exitCode !== null && exitCode !== undefined) {
-        const exitEl = document.createElement('span');
-        exitEl.className = 'exit-code ' + (exitCode === 0 ? 'success' : 'error');
-        exitEl.textContent = `Exit code: ${exitCode}`;
-        block.appendChild(exitEl);
+        const toggle = document.createElement('button');
+        toggle.className = 'code-toggle';
+        toggle.textContent = `Show all ${lines.length} lines`;
+        toggle.onclick = () => {
+            if (toggle.dataset.expanded === '1') {
+                code.textContent = lines.slice(0, MAX_PREVIEW_LINES).join('\n');
+                toggle.textContent = `Show all ${lines.length} lines`;
+                toggle.dataset.expanded = '0';
+            } else {
+                code.textContent = raw;
+                toggle.textContent = 'Collapse';
+                toggle.dataset.expanded = '1';
+            }
+        };
+        block.appendChild(toggle);
+    } else {
+        code.textContent = raw;
+        block.appendChild(code);
     }
 
     return block;
@@ -312,40 +350,104 @@ function renderDiagnostics(results) {
         return p;
     }
 
-    const table = document.createElement('table');
-    table.className = 'diag-table';
-    table.innerHTML = `
-        <thead>
-            <tr>
-                <th>Status</th>
-                <th>Check</th>
-                <th>Severity</th>
-                <th>Details</th>
-            </tr>
-        </thead>
-    `;
-    const tbody = document.createElement('tbody');
+    const container = document.createElement('div');
+    container.className = 'diag-container';
 
-    for (const check of results) {
-        const tr = document.createElement('tr');
-        const st = check.status || '';
-        const isOk = st === 'ok' || st === 'pass' || st === 'info';
-        const isWarn = st === 'warning';
-        const statusClass = isOk ? 'pass' : (isWarn ? 'warn' : 'fail');
-        const statusSymbol = isOk ? '\u2713' : (isWarn ? '\u26A0' : '\u2717');
-        const severity = (check.severity || 'info').toLowerCase();
+    // Sort: critical/errors first, then warnings, then ok
+    const order = { critical: 0, error: 1, warning: 2, info: 3, ok: 4, pass: 4 };
+    const sorted = [...results].sort((a, b) => (order[a.status] ?? 3) - (order[b.status] ?? 3));
 
-        tr.innerHTML = `
-            <td><span class="status-icon ${statusClass}">${statusSymbol}</span></td>
-            <td>${escapeHtml(check.name)}</td>
-            <td><span class="severity-badge severity-${severity}">${escapeHtml(severity)}</span></td>
-            <td>${escapeHtml(check.details || '-')}</td>
-        `;
-        tbody.appendChild(tr);
+    // Summary counts
+    const counts = { critical: 0, warning: 0, ok: 0 };
+    for (const c of sorted) {
+        const st = c.status || '';
+        if (st === 'critical' || st === 'error') counts.critical++;
+        else if (st === 'warning') counts.warning++;
+        else counts.ok++;
     }
 
-    table.appendChild(tbody);
-    return table;
+    const summary = document.createElement('div');
+    summary.className = 'diag-summary';
+    const parts = [];
+    if (counts.critical > 0) parts.push(`<span class="diag-count diag-count-critical">${counts.critical} critical</span>`);
+    if (counts.warning > 0) parts.push(`<span class="diag-count diag-count-warn">${counts.warning} warning</span>`);
+    parts.push(`<span class="diag-count diag-count-ok">${counts.ok} passed</span>`);
+    summary.innerHTML = parts.join(' ');
+    container.appendChild(summary);
+
+    // Issue rows (non-ok)
+    for (const check of sorted) {
+        const st = check.status || '';
+        const isOk = st === 'ok' || st === 'pass' || st === 'info';
+        if (isOk) continue;
+
+        const row = document.createElement('div');
+        const isWarn = st === 'warning';
+        row.className = 'diag-row diag-row-' + (isWarn ? 'warn' : 'critical');
+
+        const name = (check.name || '').replace(/^check_/, '').replace(/_/g, ' ');
+        const severity = (check.severity || 'info').toLowerCase();
+
+        row.innerHTML = `
+            <div class="diag-row-header">
+                <span class="status-icon ${isWarn ? 'warn' : 'fail'}">${isWarn ? '\u26A0' : '\u2717'}</span>
+                <span class="diag-row-name">${escapeHtml(name)}</span>
+                <span class="severity-badge severity-${severity}">${escapeHtml(severity)}</span>
+                <span class="diag-row-toggle">\u25B8</span>
+            </div>
+        `;
+
+        const details = check.details || '';
+        if (details) {
+            const detailEl = document.createElement('div');
+            detailEl.className = 'diag-row-details';
+            detailEl.style.display = 'none';
+            detailEl.textContent = details;
+            row.appendChild(detailEl);
+
+            row.querySelector('.diag-row-header').onclick = () => {
+                const isOpen = detailEl.style.display !== 'none';
+                detailEl.style.display = isOpen ? 'none' : 'block';
+                row.querySelector('.diag-row-toggle').textContent = isOpen ? '\u25B8' : '\u25BE';
+            };
+            row.querySelector('.diag-row-header').style.cursor = 'pointer';
+        }
+
+        container.appendChild(row);
+    }
+
+    // Collapsed "passed checks" section
+    if (counts.ok > 0) {
+        const passedToggle = document.createElement('div');
+        passedToggle.className = 'diag-passed-toggle';
+        passedToggle.textContent = `\u25B8 ${counts.ok} passed checks`;
+        passedToggle.style.cursor = 'pointer';
+
+        const passedList = document.createElement('div');
+        passedList.className = 'diag-passed-list';
+        passedList.style.display = 'none';
+
+        for (const check of sorted) {
+            const st = check.status || '';
+            if (st !== 'ok' && st !== 'pass' && st !== 'info') continue;
+            const name = (check.name || '').replace(/^check_/, '').replace(/_/g, ' ');
+            const item = document.createElement('div');
+            item.className = 'diag-passed-item';
+            item.innerHTML = `<span class="status-icon pass">\u2713</span> ${escapeHtml(name)}`;
+            passedList.appendChild(item);
+        }
+
+        passedToggle.onclick = () => {
+            const isOpen = passedList.style.display !== 'none';
+            passedList.style.display = isOpen ? 'none' : 'block';
+            passedToggle.textContent = (isOpen ? '\u25B8 ' : '\u25BE ') + `${counts.ok} passed checks`;
+        };
+
+        container.appendChild(passedToggle);
+        container.appendChild(passedList);
+    }
+
+    return container;
 }
 
 function renderPlan(steps) {
@@ -501,15 +603,31 @@ function onScanApps(data) {
 function onScanComplete(data) {
     removeMessage('progress-msg');
 
-    // Render OS info
+    // Build one consolidated scan report instead of 3+ separate messages
+    const report = document.createElement('div');
+    report.className = 'scan-report';
+
+    // OS + Apps on one compact line
     if (data.os_info) {
         const info = data.os_info;
-        let osText = '<strong>OS Info:</strong> ';
-        osText += escapeHtml(info.distribution || info.type || 'Unknown');
-        if (info.version) osText += ' ' + escapeHtml(info.version);
-        if (info.hostname) osText += ' | Host: ' + escapeHtml(info.hostname);
-        if (info.uptime) osText += ' | Uptime: ' + escapeHtml(info.uptime);
-        addMessage('agent', osText);
+        const os = escapeHtml(info.distribution || info.type || 'Unknown');
+        const ver = info.version ? ' ' + escapeHtml(info.version) : '';
+        const host = info.hostname ? escapeHtml(info.hostname) : '';
+        const uptime = info.uptime ? escapeHtml(info.uptime) : '';
+
+        const header = document.createElement('div');
+        header.className = 'scan-header';
+        header.innerHTML = `<strong>${os}${ver}</strong>` +
+            (host ? ` &middot; ${host}` : '') +
+            (uptime ? ` &middot; up ${uptime}` : '');
+
+        if (data.apps) {
+            const summary = summarizeApps(data.apps);
+            if (summary) {
+                header.innerHTML += `<div class="scan-apps">${escapeHtml(summary)}</div>`;
+            }
+        }
+        report.appendChild(header);
 
         // Update sidebar
         if ($('#infoOS')) $('#infoOS').textContent = info.distribution || info.type || '-';
@@ -517,20 +635,13 @@ function onScanComplete(data) {
         if ($('#infoUptime')) $('#infoUptime').textContent = info.uptime || '-';
     }
 
-    // Render discovered apps summary — apps is a dict of categories
-    if (data.apps) {
-        const summary = summarizeApps(data.apps);
-        if (summary) {
-            addMessage('agent', '<strong>Applications:</strong> ' + escapeHtml(summary));
-        }
-    }
-
-    // Render diagnostics
+    // Diagnostics
     if (data.diagnostics && data.diagnostics.length > 0) {
-        const table = renderDiagnostics(data.diagnostics);
-        addMessage('agent', table);
+        const diagEl = renderDiagnostics(data.diagnostics);
+        report.appendChild(diagEl);
     }
 
+    addMessage('agent', report);
     addMessage('system', 'Scan complete.');
 }
 
@@ -619,34 +730,66 @@ function onStepResult(data) {
         }
     }
 
-    // Show command output if present
-    if (data.stdout || data.stderr) {
-        const output = (data.stdout || '') + (data.stderr ? '\n' + data.stderr : '');
-        const block = renderCodeBlock(output.trim(), data.exit_code);
-        addMessage('agent', block);
-    }
-
     // Show skip reason if skipped
     if (data.skipped && data.reason) {
         addMessage('system', `Step ${data.step} skipped: ${data.reason}`);
+        return;
     }
 
-    // Show AI analysis if present
-    if (data.analysis) {
-        const analysis = data.analysis;
-        if (analysis.summary) {
-            addMessage('agent', escapeHtml(analysis.summary));
-        }
-        if (analysis.issues_found && analysis.issues_found.length > 0) {
-            let issueHtml = '<strong>Issues found:</strong><br>';
-            analysis.issues_found.forEach(i => { issueHtml += `- ${escapeHtml(i)}<br>`; });
-            addMessage('agent', issueHtml);
-        }
-        if (analysis.recommendations && analysis.recommendations.length > 0) {
-            let recHtml = '<strong>Recommendations:</strong><br>';
-            analysis.recommendations.forEach(r => { recHtml += `- ${escapeHtml(r)}<br>`; });
-            addMessage('agent', recHtml);
-        }
+    // Build a single consolidated message: analysis summary + issues on top,
+    // collapsible command output underneath — not 4 separate messages.
+    const wrapper = document.createElement('div');
+    wrapper.className = 'step-result-card';
+
+    const analysis = data.analysis || {};
+    const hasIssues = analysis.issues_found && analysis.issues_found.length > 0;
+    const hasRecs = analysis.recommendations && analysis.recommendations.length > 0;
+
+    // Analysis summary line
+    if (analysis.summary) {
+        const summaryEl = document.createElement('div');
+        summaryEl.className = 'step-summary' + (hasIssues ? ' step-summary-warn' : '');
+        summaryEl.textContent = analysis.summary;
+        wrapper.appendChild(summaryEl);
+    }
+
+    // Issues (if any) — these are critical, always visible
+    if (hasIssues) {
+        const issuesEl = document.createElement('div');
+        issuesEl.className = 'step-issues';
+        analysis.issues_found.forEach(i => {
+            const item = document.createElement('div');
+            item.className = 'step-issue-item';
+            item.innerHTML = `<span class="status-icon warn">\u26A0</span> ${escapeHtml(i)}`;
+            issuesEl.appendChild(item);
+        });
+        wrapper.appendChild(issuesEl);
+    }
+
+    // Recommendations — compact list
+    if (hasRecs) {
+        const recsEl = document.createElement('div');
+        recsEl.className = 'step-recommendations';
+        analysis.recommendations.forEach(r => {
+            const item = document.createElement('div');
+            item.className = 'step-rec-item';
+            item.innerHTML = `\u2192 ${escapeHtml(r)}`;
+            recsEl.appendChild(item);
+        });
+        wrapper.appendChild(recsEl);
+    }
+
+    // Command output — collapsible, below the analysis
+    if (data.stdout || data.stderr) {
+        const output = (data.stdout || '') + (data.stderr ? '\n' + data.stderr : '');
+        const cmdLabel = data.command ? data.command.split(' ').slice(0, 3).join(' ') : '';
+        const block = renderCodeBlock(output.trim(), data.exit_code, cmdLabel);
+        wrapper.appendChild(block);
+    }
+
+    // Only add a message if there's actually content
+    if (wrapper.children.length > 0) {
+        addMessage('agent', wrapper);
     }
 }
 
