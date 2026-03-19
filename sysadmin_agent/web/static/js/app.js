@@ -1871,6 +1871,68 @@ function onRustPteroResult(data) {
     addMessage('agent', `<strong>Pterodactyl: ${escapeHtml(action)}</strong>\n<pre class="rcon-output">${escapeHtml(result)}</pre>`);
 }
 
+// ---------- Model Selection ----------
+
+function loadModels() {
+    fetch('/api/models')
+        .then(r => r.json())
+        .then(data => {
+            const select = $('#modelSelect');
+            if (!select) return;
+
+            const models = data.models || [];
+            const selected = data.selected || '';
+
+            // Preserve current selection if no server-side selection
+            const currentVal = select.value;
+
+            select.innerHTML = '';
+            if (models.length === 0) {
+                select.innerHTML = '<option value="">No models available</option>';
+                return;
+            }
+
+            models.forEach(m => {
+                const opt = document.createElement('option');
+                opt.value = m.id;
+                opt.textContent = m.display_name || m.id;
+                select.appendChild(opt);
+            });
+
+            // Set selected model: server selection > current > default
+            if (selected) {
+                select.value = selected;
+            } else if (currentVal && [...select.options].some(o => o.value === currentVal)) {
+                select.value = currentVal;
+            }
+            // If nothing matched, the first option is selected by default
+        })
+        .catch(() => {
+            const select = $('#modelSelect');
+            if (select && select.options.length <= 1) {
+                select.innerHTML = '<option value="">Failed to load models</option>';
+            }
+        });
+}
+
+function changeModel(modelId) {
+    if (!modelId) return;
+    fetch('/api/models/select', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ model: modelId }),
+    })
+    .then(r => r.json())
+    .then(data => {
+        if (data.status === 'ok') {
+            showFlash(`Model switched to ${modelId}`, 'success');
+        } else {
+            showFlash(data.error || 'Failed to switch model', 'error');
+        }
+    })
+    .catch(() => showFlash('Failed to switch model', 'error'));
+}
+
 // ---------- Dashboard Init ----------
 
 function initDashboard() {
@@ -1879,6 +1941,7 @@ function initDashboard() {
     initChatInput();
     loadProfiles();
     checkForUpdates();
+    loadModels();
     // Fetch initial token data
     fetch('/api/tokens').then(r => r.json()).then(data => {
         tokenBreakdown = data;
@@ -1894,6 +1957,8 @@ function initDashboard() {
     }).catch(() => {});
     // Check for updates periodically (every 30 minutes)
     setInterval(checkForUpdates, 30 * 60 * 1000);
+    // Refresh model list every 5 minutes
+    setInterval(loadModels, 5 * 60 * 1000);
 }
 
 // ---------- Auto-init on page load ----------
