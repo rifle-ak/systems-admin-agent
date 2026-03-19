@@ -117,6 +117,8 @@ _conversations: dict[str, list] = {}
 _pending_approvals: dict[str, dict] = {}
 # sid -> AgentBrain (persistent per session for token tracking)
 _brains: dict[str, object] = {}
+# sid -> selected model name (overrides default)
+_selected_models: dict[str, str] = {}
 # sid -> RconClient
 _rcon_connections: dict[str, object] = {}
 # sid -> PterodactylAPI
@@ -290,12 +292,20 @@ def _get_conversation(sid: str) -> list:
 
 def _get_brain(sid: str):
     """Return a session-persistent AgentBrain so token usage accumulates.
-    Also hooks into the global persistent token tracker."""
-    if sid not in _brains:
+    Also hooks into the global persistent token tracker.
+    If the user has selected a different model, recreate the brain."""
+    selected = _selected_models.get(sid)
+    existing = _brains.get(sid)
+
+    # Recreate if model changed or brain doesn't exist yet
+    if existing is None or (selected and existing.model != selected):
         mods = _import_agent_modules()
-        brain = mods["AgentBrain"](
-            usage_callback=lambda inp, out: _token_tracker.add_usage(inp, out),
-        )
+        kwargs = {
+            "usage_callback": lambda inp, out: _token_tracker.add_usage(inp, out),
+        }
+        if selected:
+            kwargs["model"] = selected
+        brain = mods["AgentBrain"](**kwargs)
         _brains[sid] = brain
     return _brains[sid]
 
@@ -726,6 +736,7 @@ def handle_disconnect():
     _session_data.pop(sid, None)
     _conversations.pop(sid, None)
     _brains.pop(sid, None)
+    _selected_models.pop(sid, None)
     # Clean up Rust connections
     rcon = _rcon_connections.pop(sid, None)
     if rcon:
@@ -829,6 +840,7 @@ def handle_disconnect_server(data=None):
     _session_data.pop(sid, None)
     _conversations.pop(sid, None)
     _brains.pop(sid, None)
+    _selected_models.pop(sid, None)
     rcon = _rcon_connections.pop(sid, None)
     if rcon:
         try:
@@ -1847,6 +1859,79 @@ def unblock_ip():
     _ip_blocked.pop(ip, None)
     _ip_fail_counts.pop(ip, None)
     return jsonify({"status": "ok", "ip": ip})
+
+
+# ---------------------------------------------------------------------------
+# HTTP Routes — Model selection
+# ---------------------------------------------------------------------------
+
+# Cache for model list to avoid hitting the API on every request
+_models_cache: dict = {"models": [], "fetched_at": 0.0}
+_MODELS_CACHE_TTL = 300  # 5 minutes
+
+
+@app.route("/api/models", methods=["GET"])
+@_require_auth
+def list_models():
+    """Return available Claude models from the Anthropic API.
+    Results are cached for 5 minutes to avoid excessive API calls."""
+    import time as _time
+
+    now = _time.time()
+    if _models_cache["models"] and (now - _models_cache["fetched_at"]) < _MODELS_CACHE_TTL:
+        return jsonify({
+            "models": _models_cache["models"],
+            "selected": _selected_models.get(_get_flask_sid()),
+        })
+
+    try:
+        from anthropic import Anthropic
+        client = Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY"))
+        response = client.models.list(limit=100)
+        models = []
+        for m in response.data:
+            models.append({
+                "id": m.id,
+                "display_name": getattr(m, "display_name", m.id),
+                "created_at": getattr(m, "created_at", None),
+            })
+        # Sort by display name for cleaner UI
+        models.sort(key=lambda x: x["display_name"])
+        _models_cache["models"] = models
+        _models_cache["fetched_at"] = now
+    except Exception as exc:
+        logger.warning("Failed to fetch models from Anthropic API: %s", exc)
+        # Fall back to a basic list if API call fails
+        if not _models_cache["models"]:
+            _models_cache["models"] = [
+                {"id": "claude-sonnet-4-20250514", "display_name": "Claude Sonnet 4"},
+                {"id": "claude-opus-4-20250514", "display_name": "Claude Opus 4"},
+                {"id": "claude-haiku-3-5-20241022", "display_name": "Claude 3.5 Haiku"},
+            ]
+
+    return jsonify({
+        "models": _models_cache["models"],
+        "selected": _selected_models.get(_get_flask_sid()),
+    })
+
+
+@app.route("/api/models/select", methods=["POST"])
+@_require_auth
+def select_model():
+    """Change the AI model for the current session."""
+    data = request.get_json(force=True)
+    model_id = (data.get("model") or "").strip()
+    if not model_id:
+        return jsonify({"error": "Model ID required"}), 400
+
+    sid = _get_flask_sid()
+    _selected_models[sid] = model_id
+
+    # Force brain recreation on next use
+    _brains.pop(sid, None)
+
+    logger.info("Session %s switched model to %s", sid, model_id)
+    return jsonify({"status": "ok", "model": model_id})
 
 
 # ---------------------------------------------------------------------------

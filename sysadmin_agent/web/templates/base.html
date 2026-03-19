@@ -28,6 +28,11 @@
                 <span class="status-dot disconnected"></span>
                 <span class="status-text">Disconnected</span>
             </div>
+            <div class="model-selector" id="modelSelector">
+                <select id="modelSelect" class="model-select" onchange="changeModel(this.value)" title="Select AI model">
+                    <option value="">Loading models...</option>
+                </select>
+            </div>
             <div class="token-usage" id="tokenUsage" title="Click for token details" onclick="showTokenDetails()" style="cursor:pointer;">
                 <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2">
                     <circle cx="12" cy="12" r="10"/>
