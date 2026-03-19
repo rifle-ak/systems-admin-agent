@@ -277,7 +277,7 @@ function updateProgress(text) {
     const existingId = 'progress-msg';
     let el = document.getElementById(existingId);
     if (!el) {
-        el = addMessage('agent', `<span id="progress-text">${escapeHtml(text)}</span>`, { id: existingId });
+        el = addMessage('agent', `<span class="progress-indicator"><span class="progress-spinner"></span> <span id="progress-text">${escapeHtml(text)}</span></span>`, { id: existingId });
     } else {
         const textEl = el.querySelector('#progress-text');
         if (textEl) textEl.textContent = text;
@@ -794,6 +794,12 @@ function connectServer(e) {
         passphrase: authType === 'key' ? ($('#passphrase')?.value || undefined) : undefined,
     };
 
+    // Include selected profile name so the backend can look up saved credentials
+    const profileSelect = $('#profileSelect');
+    if (profileSelect?.value) {
+        payload.profile_name = profileSelect.value;
+    }
+
     setConnectionStatus('connecting', 'Connecting...');
     addMessage('system', `Connecting to ${escapeHtml(payload.host)}:${payload.port}...`);
     socket.emit('connect_server', payload);
@@ -935,6 +941,35 @@ function loadProfile() {
         delete $('#sshPassword').dataset.savedPassword;
     }
 
+    // Rust admin fields
+    if (profile.rcon_host && $('#rconHost')) $('#rconHost').value = profile.rcon_host;
+    if (profile.rcon_port && $('#rconPort')) $('#rconPort').value = profile.rcon_port;
+    if (profile.rcon_password_saved && $('#rconPassword')) {
+        $('#rconPassword').value = '';
+        $('#rconPassword').placeholder = '(saved in profile)';
+        $('#rconPassword').dataset.savedPassword = 'true';
+    } else if ($('#rconPassword')) {
+        $('#rconPassword').placeholder = 'RCON password';
+        delete $('#rconPassword').dataset.savedPassword;
+    }
+
+    if (profile.ptero_url && $('#pteroUrl')) $('#pteroUrl').value = profile.ptero_url;
+    if (profile.ptero_server_id && $('#pteroServerId')) $('#pteroServerId').value = profile.ptero_server_id;
+    if (profile.ptero_api_key_saved && $('#pteroApiKey')) {
+        $('#pteroApiKey').value = '';
+        $('#pteroApiKey').placeholder = '(saved in profile)';
+        $('#pteroApiKey').dataset.savedPassword = 'true';
+    } else if ($('#pteroApiKey')) {
+        $('#pteroApiKey').placeholder = 'API key (ptlc_...)';
+        delete $('#pteroApiKey').dataset.savedPassword;
+    }
+
+    // Show Rust admin panel if profile has Rust data
+    if ((profile.rcon_host || profile.ptero_url) && $('#rustAdmin')) {
+        $('#rustAdmin').style.display = 'block';
+        if ($('#rustSaveSection')) $('#rustSaveSection').style.display = 'block';
+    }
+
     showFlash('Profile loaded', 'success');
 }
 
@@ -952,6 +987,29 @@ async function saveProfile() {
         auth_type: authType,
         key_path: authType === 'key' ? ($('#keyPath')?.value || '') : '',
     };
+
+    // Include Rust admin credentials — use form inputs if visible, tracked state if hidden
+    const rconHost = $('#rconHost')?.value || _rconState.host || '';
+    const rconPort = $('#rconPort')?.value || _rconState.port || '';
+    const rconPassword = $('#rconPassword')?.value || '';
+    const pteroUrl = $('#pteroUrl')?.value || _pteroState.url || '';
+    const pteroApiKey = $('#pteroApiKey')?.value || '';
+    const pteroServerId = $('#pteroServerId')?.value || _pteroState.serverId || '';
+
+    if (rconHost) payload.rcon_host = rconHost;
+    if (rconPort) payload.rcon_port = parseInt(rconPort);
+    if (rconPassword) payload.rcon_password = rconPassword;
+    // If RCON password was already saved in profile and user didn't enter a new one, preserve it
+    if (!rconPassword && (_rconState.passwordSaved || $('#rconPassword')?.dataset.savedPassword === 'true')) {
+        payload.preserve_rcon_password = true;
+    }
+    if (pteroUrl) payload.ptero_url = pteroUrl;
+    if (pteroApiKey) payload.ptero_api_key = pteroApiKey;
+    // If API key was already saved and user didn't enter a new one, preserve it
+    if (!pteroApiKey && (_pteroState.apiKeySaved || $('#pteroApiKey')?.dataset.savedPassword === 'true')) {
+        payload.preserve_ptero_api_key = true;
+    }
+    if (pteroServerId) payload.ptero_server_id = pteroServerId;
 
     // If password auth and a password is entered, ask about saving it
     if (authType === 'password' && password) {
@@ -1293,6 +1351,12 @@ async function doUpgrade() {
             const newVer = data.new_version ? ` to v${data.new_version}` : '';
             showFlash(`Update complete${newVer}. Restarting...`, 'success');
 
+            // Re-enable button immediately so it's usable if restart fails
+            if (btn) {
+                btn.disabled = false;
+                btn.textContent = 'Update';
+            }
+
             // Auto-restart after a short delay
             if (data.restart_required) {
                 setTimeout(async () => {
@@ -1305,6 +1369,9 @@ async function doUpgrade() {
                     showFlash('Server restarting, page will reload in 5 seconds...', 'info');
                     setTimeout(() => { window.location.reload(); }, 5000);
                 }, 1000);
+            } else {
+                // No restart needed — re-check for updates
+                await checkForUpdates();
             }
         } else {
             showFlash('Update failed: ' + (data.message || 'Unknown error'), 'error');
@@ -1424,6 +1491,10 @@ async function saveBillingCycle() {
 let rconConnected = false;
 let pteroConnected = false;
 
+// Track connection values so they survive form hiding
+let _rconState = { host: '', port: 28016, passwordEntered: false, passwordSaved: false };
+let _pteroState = { url: '', serverId: '', apiKeyEntered: false, apiKeySaved: false };
+
 function toggleRustPanel() {
     const panel = $('#rustPanel');
     const arrow = $('#rustToggle');
@@ -1431,18 +1502,41 @@ function toggleRustPanel() {
     const show = panel.style.display === 'none';
     panel.style.display = show ? 'block' : 'none';
     if (arrow) arrow.textContent = show ? '▾' : '▸';
+    // Show save button whenever the panel has any connection data
+    if (show && $('#rustSaveSection')) {
+        const hasData = ($('#rconHost')?.value || _rconState.host ||
+                         $('#pteroUrl')?.value || _pteroState.url ||
+                         rconConnected || pteroConnected);
+        if (hasData) $('#rustSaveSection').style.display = 'block';
+    }
 }
 
 function connectRcon() {
     const host = ($('#rconHost') || {}).value || '';
     const port = ($('#rconPort') || {}).value || '28016';
     const password = ($('#rconPassword') || {}).value || '';
-    if (!host || !password) {
+    const useSaved = !password && $('#rconPassword')?.dataset.savedPassword === 'true';
+    if (!host || (!password && !useSaved)) {
         showFlash('RCON host and password are required', 'error');
         return;
     }
-    addMessage('system', 'Connecting to RCON...');
-    socket.emit('rust_connect_rcon', { host, port: parseInt(port), password });
+    // Track values before the form hides
+    _rconState.host = host;
+    _rconState.port = parseInt(port);
+    _rconState.passwordEntered = !!password;
+    _rconState.passwordSaved = useSaved;
+
+    updateProgress('Connecting to RCON...');
+    const payload = { host, port: parseInt(port) };
+    if (password) {
+        payload.password = password;
+    } else if (useSaved) {
+        payload.use_saved_password = true;
+        // Include profile name so backend can look up the saved password
+        const profileSelect = $('#profileSelect');
+        if (profileSelect?.value) payload.profile_name = profileSelect.value;
+    }
+    socket.emit('rust_connect_rcon', payload);
 }
 
 function disconnectRcon() {
@@ -1453,12 +1547,27 @@ function connectPtero() {
     const baseUrl = ($('#pteroUrl') || {}).value || '';
     const apiKey = ($('#pteroApiKey') || {}).value || '';
     const serverId = ($('#pteroServerId') || {}).value || '';
-    if (!baseUrl || !apiKey) {
+    const useSaved = !apiKey && $('#pteroApiKey')?.dataset.savedPassword === 'true';
+    if (!baseUrl || (!apiKey && !useSaved)) {
         showFlash('Panel URL and API key are required', 'error');
         return;
     }
-    addMessage('system', 'Connecting to Pterodactyl Panel...');
-    socket.emit('rust_connect_pterodactyl', { base_url: baseUrl, api_key: apiKey, server_id: serverId });
+    // Track values before the form hides
+    _pteroState.url = baseUrl;
+    _pteroState.serverId = serverId;
+    _pteroState.apiKeyEntered = !!apiKey;
+    _pteroState.apiKeySaved = useSaved;
+
+    updateProgress('Connecting to Pterodactyl Panel...');
+    const payload = { base_url: baseUrl, server_id: serverId };
+    if (apiKey) {
+        payload.api_key = apiKey;
+    } else if (useSaved) {
+        payload.use_saved_key = true;
+        const profileSelect = $('#profileSelect');
+        if (profileSelect?.value) payload.profile_name = profileSelect.value;
+    }
+    socket.emit('rust_connect_pterodactyl', payload);
 }
 
 function disconnectPtero() {
@@ -1466,10 +1575,12 @@ function disconnectPtero() {
 }
 
 function onRconConnected(data) {
+    removeMessage('progress-msg');
     rconConnected = true;
     if ($('#rconForm')) $('#rconForm').style.display = 'none';
     if ($('#rconConnected')) $('#rconConnected').style.display = 'flex';
     if ($('#rustActions')) $('#rustActions').style.display = 'block';
+    if ($('#rustSaveSection')) $('#rustSaveSection').style.display = 'block';
 
     let msg = 'RCON connected.';
     if (data.server_info) {
@@ -1489,15 +1600,69 @@ function onRconDisconnected() {
 }
 
 function onPteroConnected(data) {
+    removeMessage('progress-msg');
     pteroConnected = true;
     if ($('#pteroForm')) $('#pteroForm').style.display = 'none';
     if ($('#pteroConnected')) $('#pteroConnected').style.display = 'flex';
+    if ($('#rustSaveSection')) $('#rustSaveSection').style.display = 'block';
+
+    const servers = data.servers || [];
+    const selectedId = data.selected_server || '';
+
+    // Find the selected server's name for display
+    const selectedServer = servers.find(s => s.identifier === selectedId);
+    const selectedName = selectedServer ? selectedServer.name : selectedId;
 
     let msg = 'Pterodactyl Panel connected.';
-    if (data.servers && data.servers.length > 0) {
-        msg += ` Found ${data.servers.length} server(s).`;
+    if (servers.length > 0) {
+        msg += ` Found ${servers.length} server(s):\n`;
+        for (const s of servers) {
+            const marker = s.identifier === selectedId ? ' ← selected' : '';
+            const desc = s.description ? ` — ${s.description}` : '';
+            msg += `  • <strong>${escapeHtml(s.name || s.identifier)}</strong>${escapeHtml(desc)}${marker}\n`;
+        }
+        if (selectedName) {
+            msg += `\nActive server: <strong>${escapeHtml(selectedName)}</strong>`;
+        }
     }
     addMessage('system', msg);
+
+    // If multiple servers, show a selector so the user can switch
+    if (servers.length > 1) {
+        let selectHtml = '<div class="ptero-server-select" style="margin:8px 0;">';
+        selectHtml += '<label>Switch server: </label>';
+        selectHtml += '<select id="pteroServerSelect" onchange="switchPteroServer(this.value)">';
+        for (const s of servers) {
+            const sel = s.identifier === selectedId ? ' selected' : '';
+            const label = s.name || s.identifier;
+            selectHtml += `<option value="${escapeHtml(s.identifier)}"${sel}>${escapeHtml(label)}</option>`;
+        }
+        selectHtml += '</select></div>';
+        addMessage('system', selectHtml);
+    }
+
+    if (data.warning) {
+        addMessage('system', `⚠️ ${escapeHtml(data.warning)}`);
+    }
+}
+
+function switchPteroServer(serverId) {
+    if (!serverId) return;
+    addMessage('system', `Switching to server ${escapeHtml(serverId)}...`);
+    // Re-emit with the new server_id — the backend will update the stored connection
+    const payload = { server_id: serverId };
+    // Reuse existing connection credentials
+    if (_pteroState.url) payload.base_url = _pteroState.url;
+    if (_pteroState.apiKeyEntered) {
+        const apiKey = ($('#pteroApiKey') || {}).value || '';
+        if (apiKey) payload.api_key = apiKey;
+    }
+    if (_pteroState.apiKeySaved) {
+        payload.use_saved_key = true;
+        const profileSelect = $('#profileSelect');
+        if (profileSelect?.value) payload.profile_name = profileSelect.value;
+    }
+    socket.emit('rust_connect_pterodactyl', payload);
 }
 
 function onPteroDisconnected() {
@@ -1523,23 +1688,24 @@ function onRconResponse(data) {
 }
 
 function rustAction(action) {
-    addMessage('system', `Running: ${action}...`);
+    updateProgress(`Running: ${action}...`);
     socket.emit('rust_quick_action', { action });
 }
 
 function onRustActionResult(data) {
+    removeMessage('progress-msg');
     const action = data.action || 'action';
     const result = typeof data.result === 'string' ? data.result : JSON.stringify(data.result, null, 2);
     addMessage('agent', `<strong>${escapeHtml(action)}</strong>\n<pre class="rcon-output">${escapeHtml(result)}</pre>`);
 }
 
 function rustRunDiagnostics() {
-    addMessage('system', 'Running Rust server diagnostics...');
+    updateProgress('Running Rust server diagnostics...');
     socket.emit('rust_run_diagnostics', {});
 }
 
 function rustDiagnoseLag() {
-    addMessage('system', 'Diagnosing lag and rubber-banding...');
+    updateProgress('Diagnosing lag and rubber-banding...');
     socket.emit('rust_diagnose_lag', {});
 }
 
@@ -1550,50 +1716,140 @@ function onRustDiagnosticsResult(data) {
         addMessage('agent', 'No diagnostic results.');
         return;
     }
-    const table = renderRustDiagnostics(results);
-    addMessage('agent', table);
+
+    // Separate issues from healthy checks
+    const issues = results.filter(r => r.status !== 'ok');
+    const healthy = results.filter(r => r.status === 'ok');
+
+    // Sort issues by severity
+    const sevOrder = { critical: 0, high: 1, medium: 2, low: 3 };
+    issues.sort((a, b) => (sevOrder[a.severity] || 99) - (sevOrder[b.severity] || 99));
+
+    const html = renderRustDiagnostics(issues, healthy);
+    addMessage('agent', html);
 }
 
 function onRustLagResult(data) {
     removeMessage('progress-msg');
-    const diagnosis = data.diagnosis || [];
-    if (diagnosis.length === 0) {
-        addMessage('agent', 'No lag issues detected.');
+    const report = data.diagnosis || {};
+    const findings = report.findings || [];
+    const summary = report.summary || '';
+    const timestamp = report.timestamp || '';
+
+    if (findings.length === 0) {
+        let html = '<div class="diag-report">';
+        html += '<div class="diag-header diag-header-ok"><strong>Lag Diagnosis</strong> — No obvious issues detected</div>';
+        if (summary) html += `<div class="diag-summary">${escapeHtml(summary)}</div>`;
+        if (timestamp) html += `<div class="diag-timestamp">${escapeHtml(timestamp)}</div>`;
+        html += '</div>';
+        addMessage('agent', html);
         return;
     }
-    let html = '<strong>Lag Diagnosis</strong> (ranked by probability)<br><br>';
-    html += '<table class="diag-table"><thead><tr><th>Check</th><th>Status</th><th>Severity</th><th>Details</th></tr></thead><tbody>';
-    for (const item of diagnosis) {
-        const sevClass = item.severity === 'critical' ? 'diag-critical' :
-                         item.severity === 'high' ? 'diag-high' :
-                         item.severity === 'warning' ? 'diag-warning' : 'diag-ok';
-        html += `<tr class="${sevClass}">`;
-        html += `<td>${escapeHtml(item.name || item.check || '')}</td>`;
-        html += `<td>${escapeHtml(item.status || '')}</td>`;
-        html += `<td>${escapeHtml(item.severity || '')}</td>`;
-        html += `<td>${escapeHtml(item.message || item.details || '')}</td>`;
-        html += `</tr>`;
+
+    let html = '<div class="diag-report">';
+    html += '<div class="diag-header diag-header-warn"><strong>Lag Diagnosis</strong> — Issues found (ranked by severity)</div>';
+    if (summary) html += `<div class="diag-summary">${escapeHtml(summary)}</div>`;
+
+    for (const f of findings) {
+        const sevClass = f.severity === 'critical' ? 'diag-card-critical' :
+                         f.severity === 'high' ? 'diag-card-high' :
+                         f.severity === 'medium' ? 'diag-card-medium' : 'diag-card-low';
+        html += `<div class="diag-card ${sevClass}">`;
+        html += `<div class="diag-card-title"><span class="diag-sev-badge diag-sev-${escapeHtml(f.severity)}">${escapeHtml(f.severity).toUpperCase()}</span> ${escapeHtml(f.cause || '')}</div>`;
+        html += `<div class="diag-card-details">${escapeHtml(f.details || '')}</div>`;
+        if (f.likely_reason) html += `<div class="diag-card-reason"><strong>Why:</strong> ${escapeHtml(f.likely_reason)}</div>`;
+        if (f.fix) html += `<div class="diag-card-fix"><strong>Fix:</strong> ${escapeHtml(f.fix)}</div>`;
+        html += '</div>';
     }
-    html += '</tbody></table>';
+
+    if (timestamp) html += `<div class="diag-timestamp">${escapeHtml(timestamp)}</div>`;
+    html += '</div>';
     addMessage('agent', html);
 }
 
-function renderRustDiagnostics(results) {
-    let html = '<strong>Rust Server Diagnostics</strong><br><br>';
-    html += '<table class="diag-table"><thead><tr><th>Check</th><th>Status</th><th>Severity</th><th>Details</th></tr></thead><tbody>';
-    for (const r of results) {
-        const sevClass = r.severity === 'critical' ? 'diag-critical' :
-                         r.severity === 'high' ? 'diag-high' :
-                         r.severity === 'warning' ? 'diag-warning' : 'diag-ok';
-        html += `<tr class="${sevClass}">`;
-        html += `<td>${escapeHtml(r.name || '')}</td>`;
-        html += `<td>${escapeHtml(r.status || '')}</td>`;
-        html += `<td>${escapeHtml(r.severity || '')}</td>`;
-        html += `<td>${escapeHtml(r.message || '')}</td>`;
-        html += `</tr>`;
+function renderRustDiagnostics(issues, healthy) {
+    let html = '<div class="diag-report">';
+
+    // Header with issue count
+    if (issues.length === 0) {
+        html += '<div class="diag-header diag-header-ok"><strong>Server Diagnostics</strong> — All checks passed</div>';
+    } else {
+        const critical = issues.filter(r => r.severity === 'high' && r.status === 'critical').length;
+        const warnings = issues.length - critical;
+        let label = '';
+        if (critical) label += `${critical} critical`;
+        if (critical && warnings) label += ', ';
+        if (warnings) label += `${warnings} warning(s)`;
+        html += `<div class="diag-header diag-header-warn"><strong>Server Diagnostics</strong> — ${label} found</div>`;
     }
-    html += '</tbody></table>';
+
+    // Issue cards with full details and fix buttons
+    for (const r of issues) {
+        const sevClass = r.status === 'critical' ? 'diag-card-critical' :
+                         r.severity === 'high' ? 'diag-card-high' :
+                         r.severity === 'medium' ? 'diag-card-medium' : 'diag-card-low';
+        const friendlyName = (r.name || '').replace('check_', '').replace(/_/g, ' ');
+        html += `<div class="diag-card ${sevClass}">`;
+        html += `<div class="diag-card-title"><span class="diag-sev-badge diag-sev-${escapeHtml(r.severity)}">${escapeHtml(r.status || r.severity).toUpperCase()}</span> ${escapeHtml(friendlyName)}</div>`;
+        html += `<div class="diag-card-details">${escapeHtml(r.details || '(no details)')}</div>`;
+
+        // Render fix suggestions as actionable buttons
+        if (r.fix && Array.isArray(r.fix) && r.fix.length > 0) {
+            html += '<div class="diag-card-fixes">';
+            html += '<strong>Suggested fixes:</strong>';
+            for (const fix of r.fix) {
+                const isDestructive = fix.destructive;
+                const btnClass = isDestructive ? 'btn-fix btn-fix-destructive' : 'btn-fix';
+                const icon = isDestructive ? '⚠ ' : '▶ ';
+                if (fix.command_rcon) {
+                    html += `<button class="${btnClass}" onclick="confirmAndRunFix('rcon', '${escapeHtml(fix.command_rcon)}', ${isDestructive})" title="${escapeHtml(fix.description || '')}">`;
+                    html += `${icon}${escapeHtml(fix.description || fix.command_rcon)} <code>${escapeHtml(fix.command_rcon)}</code></button>`;
+                } else if (fix.command_ptero) {
+                    html += `<button class="${btnClass}" onclick="confirmAndRunFix('ptero', '${escapeHtml(fix.command_ptero)}', ${isDestructive})" title="${escapeHtml(fix.description || '')}">`;
+                    html += `${icon}${escapeHtml(fix.description || fix.command_ptero)} <code>${escapeHtml(fix.command_ptero)}</code></button>`;
+                }
+            }
+            html += '</div>';
+        }
+        html += '</div>';
+    }
+
+    // Collapsible healthy checks summary
+    if (healthy.length > 0) {
+        html += '<details class="diag-healthy-section">';
+        html += `<summary class="diag-healthy-summary">${healthy.length} check(s) passed</summary>`;
+        html += '<div class="diag-healthy-list">';
+        for (const r of healthy) {
+            const friendlyName = (r.name || '').replace('check_', '').replace(/_/g, ' ');
+            html += `<div class="diag-healthy-item"><span class="diag-check-ok">✓</span> <strong>${escapeHtml(friendlyName)}</strong>`;
+            if (r.details) html += ` — ${escapeHtml(r.details)}`;
+            html += '</div>';
+        }
+        html += '</div></details>';
+    }
+
+    html += '</div>';
     return html;
+}
+
+function confirmAndRunFix(type, command, isDestructive) {
+    const label = isDestructive ? 'DESTRUCTIVE' : 'safe';
+    const msg = isDestructive
+        ? `⚠️ This is a DESTRUCTIVE action.\n\nCommand: ${command}\n\nAre you sure you want to run this?`
+        : `Run this fix?\n\nCommand: ${command}`;
+    if (!confirm(msg)) return;
+
+    if (type === 'rcon') {
+        updateProgress(`Running fix: ${command}...`);
+        socket.emit('rust_rcon_command', { command });
+    } else if (type === 'ptero') {
+        // Handle ptero commands like "power:restart"
+        const parts = command.split(':');
+        if (parts.length === 2 && parts[0] === 'power') {
+            updateProgress(`Running fix: ${parts[1]} server...`);
+            socket.emit('rust_ptero_action', { action: parts[1] });
+        }
+    }
 }
 
 function onRustPluginResult(data) {
@@ -1609,6 +1865,7 @@ function onRustPluginResult(data) {
 }
 
 function onRustPteroResult(data) {
+    removeMessage('progress-msg');
     const action = data.action || '';
     const result = typeof data.result === 'string' ? data.result : JSON.stringify(data.result, null, 2);
     addMessage('agent', `<strong>Pterodactyl: ${escapeHtml(action)}</strong>\n<pre class="rcon-output">${escapeHtml(result)}</pre>`);

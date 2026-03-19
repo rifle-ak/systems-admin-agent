@@ -3,9 +3,13 @@
 Supports both the Application API (admin) and Client API (server owner).
 Used for managing Rust game servers hosted on Pterodactyl/Wings.
 
+.. note:: Uses ``from __future__ import annotations`` for Python <3.10
+   compatibility with ``str | None`` type hints.
+
 API reference:
   https://dashflo.net/docs/api/pterodactyl/v1/
 """
+from __future__ import annotations
 
 import json
 import logging
@@ -51,6 +55,8 @@ class PterodactylAPI:
         self._client_base = f"{self.panel_url}/api/client"
         # Default base depends on key type
         self._base = self._app_base if self._is_application else self._client_base
+        # Detected at runtime by list_servers()
+        self._client_api_available = not self._is_application
 
     # ------------------------------------------------------------------
     # Generic request helpers
@@ -125,18 +131,32 @@ class PterodactylAPI:
     def list_servers(self) -> list:
         """List all servers the API key has access to.
 
-        Always uses the Client API for listing since it returns the short
-        identifier needed for all other Client API calls.
+        Tries Client API first (returns short identifiers needed for most
+        operations).  Falls back to Application API if the key doesn't have
+        client scope.
         """
-        resp = self._get("", use_client=True)
+        # Try Client API first
+        try:
+            resp = self._get("", use_client=True)
+            self._client_api_available = True
+        except PterodactylAPIError as e:
+            if e.status_code in (401, 403):
+                # Client API not available with this key — use Application API
+                resp = self._get("servers")
+                self._client_api_available = False
+            else:
+                raise
+
         data = resp.get("data", [])
         servers = []
         for item in data:
             attrs = item.get("attributes", {})
             servers.append({
-                # Short identifier (e.g. "dd4f6272") — use this for all API calls
+                # Short identifier (e.g. "dd4f6272") — use this for Client API calls
                 "identifier": attrs.get("identifier", ""),
                 "uuid": attrs.get("uuid", ""),
+                # Application API uses numeric "id" instead of "identifier"
+                "internal_id": attrs.get("id", ""),
                 "name": attrs.get("name", ""),
                 "description": attrs.get("description", ""),
                 "status": attrs.get("status"),
@@ -146,14 +166,27 @@ class PterodactylAPI:
             })
         return servers
 
+    def _require_client_api(self, action="this operation"):
+        """Raise a helpful error if Client API is not available."""
+        if not self._client_api_available:
+            raise PterodactylAPIError(
+                f"Cannot {action}: requires a Client API key (ptlc_...). "
+                f"Your Application API key (ptla_) can list servers but cannot "
+                f"manage them. Create a Client API key in the Pterodactyl panel "
+                f"under your Account > API Credentials.",
+                status_code=403,
+            )
+
     def get_server(self, server_id) -> dict:
         """Get details for a specific server (Client API)."""
+        self._require_client_api("get server details")
         resp = self._get(f"/servers/{server_id}", use_client=True)
         return resp.get("attributes", resp)
 
     def get_resources(self, server_id) -> dict:
         """Get current resource usage (CPU, memory, disk, network, uptime).
         This is a Client API endpoint — always routes through /api/client."""
+        self._require_client_api("get server resources")
         resp = self._get(f"/servers/{server_id}/resources", use_client=True)
         attrs = resp.get("attributes", resp)
         return {
@@ -164,11 +197,13 @@ class PterodactylAPI:
 
     def send_command(self, server_id, command) -> dict:
         """Send a console command to the server (Client API)."""
+        self._require_client_api("send console command")
         return self._post(f"/servers/{server_id}/command",
                           {"command": command}, use_client=True)
 
     def set_power_state(self, server_id, signal) -> dict:
         """Change server power state (Client API). Signal: start, stop, restart, kill."""
+        self._require_client_api("change power state")
         if signal not in ("start", "stop", "restart", "kill"):
             raise ValueError(f"Invalid power signal: {signal}")
         return self._post(f"/servers/{server_id}/power",
@@ -180,6 +215,7 @@ class PterodactylAPI:
 
     def list_files(self, server_id, directory="/") -> list:
         """List files in a server directory (Client API)."""
+        self._require_client_api("list files")
         from urllib.parse import quote
         encoded_dir = quote(directory, safe="/")
         resp = self._get(f"/servers/{server_id}/files/list?directory={encoded_dir}",
@@ -322,48 +358,215 @@ class PterodactylAPI:
         return {"deleted": map_files}
 
     def rust_get_server_cfg(self, server_id) -> str:
-        """Read the Rust server.cfg file."""
-        try:
-            return self.get_file_contents(server_id, "/server/rust/cfg/server.cfg")
-        except PterodactylAPIError:
-            # Try alternate path
+        """Read the Rust server configuration file.
+
+        Searches multiple container roots and config file names since
+        the layout varies by Pterodactyl egg.
+        """
+        roots = ["/server/rust", "/", "/home/container", "/server"]
+        cfg_names = ["cfg/server.cfg", "server.cfg", "cfg/serverauto.cfg",
+                     "serverauto.cfg"]
+        for root in roots:
+            for name in cfg_names:
+                path = f"{root}/{name}" if root != "/" else f"/{name}"
+                try:
+                    content = self.get_file_contents(server_id, path)
+                    if content and content.strip():
+                        return content
+                except PterodactylAPIError:
+                    continue
+        return ""
+
+    def _discover_oxide_root(self, server_id) -> str | None:
+        """Discover the actual Oxide root directory.
+
+        Searches multiple possible parent directories since the container
+        layout varies by egg/setup. The Pterodactyl file API root is the
+        container root, so paths may be /oxide/, /server/rust/oxide/, etc.
+
+        Returns the full path like '/server/rust/oxide' or '/oxide' or None.
+        """
+        search_roots = [
+            "/server/rust",
+            "/",
+            "/home/container",
+            "/server",
+        ]
+        for root in search_roots:
             try:
-                return self.get_file_contents(server_id, "/server/rust/server.cfg")
+                files = self.list_files(server_id, root)
+                for f in files:
+                    if not f["is_file"] and f["name"].lower() == "oxide":
+                        path = f"{root}/{f['name']}" if root != "/" else f"/{f['name']}"
+                        return path
             except PterodactylAPIError:
-                return ""
+                continue
+        return None
+
+    def _discover_oxide_subdirs(self, server_id, oxide_root) -> dict:
+        """List subdirectories of the Oxide root and map them by purpose.
+
+        Returns a dict like {'plugins': '/server/rust/oxide/plugins',
+                             'logs': '/server/rust/oxide/logs', ...}
+        """
+        result = {}
+        try:
+            files = self.list_files(server_id, oxide_root)
+            for f in files:
+                if f["is_file"]:
+                    continue
+                name_lower = f["name"].lower()
+                full_path = f"{oxide_root}/{f['name']}"
+                if name_lower == "plugins":
+                    result["plugins"] = full_path
+                elif name_lower == "logs":
+                    result["logs"] = full_path
+                elif name_lower == "config":
+                    result["config"] = full_path
+                elif name_lower == "data":
+                    result["data"] = full_path
+                elif name_lower == "lang":
+                    result["lang"] = full_path
+        except PterodactylAPIError:
+            pass
+        return result
 
     def rust_list_oxide_plugins(self, server_id) -> list:
-        """List Oxide plugin files on disk."""
-        try:
-            files = self.list_files(server_id, "/server/rust/oxide/plugins")
-            return [f for f in files if f["is_file"] and f["name"].endswith(".cs")]
-        except PterodactylAPIError:
-            return []
+        """List Oxide plugin files on disk.
+
+        Discovers the actual Oxide directory structure dynamically.
+        """
+        # Dynamic discovery
+        oxide_root = self._discover_oxide_root(server_id)
+        if oxide_root:
+            subdirs = self._discover_oxide_subdirs(server_id, oxide_root)
+            if "plugins" in subdirs:
+                try:
+                    files = self.list_files(server_id, subdirs["plugins"])
+                    plugins = [f for f in files if f["is_file"] and f["name"].endswith(".cs")]
+                    if plugins:
+                        return plugins
+                except PterodactylAPIError:
+                    pass
+
+        # Fallback to hardcoded paths
+        plugin_paths = [
+            "/server/rust/oxide/plugins",
+            "/server/rust/Oxide/Plugins",
+            "/server/rust/Oxide/plugins",
+            "/server/rust/oxide/Plugins",
+        ]
+        for path in plugin_paths:
+            try:
+                files = self.list_files(server_id, path)
+                plugins = [f for f in files if f["is_file"] and f["name"].endswith(".cs")]
+                if plugins:
+                    return plugins
+            except PterodactylAPIError:
+                continue
+        return []
 
     def rust_get_oxide_config(self, server_id, plugin_name) -> str:
         """Read an Oxide plugin config file."""
-        path = f"/server/rust/oxide/config/{plugin_name}.json"
-        try:
-            return self.get_file_contents(server_id, path)
-        except PterodactylAPIError:
-            return ""
+        # Dynamic discovery
+        oxide_root = self._discover_oxide_root(server_id)
+        if oxide_root:
+            subdirs = self._discover_oxide_subdirs(server_id, oxide_root)
+            if "config" in subdirs:
+                try:
+                    content = self.get_file_contents(
+                        server_id, f"{subdirs['config']}/{plugin_name}.json")
+                    if content:
+                        return content
+                except PterodactylAPIError:
+                    pass
+
+        # Fallback
+        config_paths = [
+            f"/server/rust/oxide/config/{plugin_name}.json",
+            f"/server/rust/Oxide/Config/{plugin_name}.json",
+            f"/server/rust/Oxide/config/{plugin_name}.json",
+        ]
+        for path in config_paths:
+            try:
+                content = self.get_file_contents(server_id, path)
+                if content:
+                    return content
+            except PterodactylAPIError:
+                continue
+        return ""
 
     def rust_write_oxide_config(self, server_id, plugin_name, config) -> dict:
         """Write an Oxide plugin config file."""
-        path = f"/server/rust/oxide/config/{plugin_name}.json"
+        # Dynamic discovery for the right config path
+        write_path = None
+        oxide_root = self._discover_oxide_root(server_id)
+        if oxide_root:
+            subdirs = self._discover_oxide_subdirs(server_id, oxide_root)
+            if "config" in subdirs:
+                write_path = f"{subdirs['config']}/{plugin_name}.json"
+
+        if not write_path:
+            # Fallback: try to find the existing config path
+            config_paths = [
+                f"/server/rust/oxide/config/{plugin_name}.json",
+                f"/server/rust/Oxide/Config/{plugin_name}.json",
+                f"/server/rust/Oxide/config/{plugin_name}.json",
+            ]
+            write_path = config_paths[0]
+            for path in config_paths:
+                try:
+                    existing = self.get_file_contents(server_id, path)
+                    if existing:
+                        write_path = path
+                        break
+                except PterodactylAPIError:
+                    continue
+
         if isinstance(config, dict):
             config = json.dumps(config, indent=2)
-        return self.write_file(server_id, path, config)
+        return self.write_file(server_id, write_path, config)
 
     def rust_get_oxide_logs(self, server_id, limit=50) -> list:
-        """List recent Oxide log files."""
-        try:
-            files = self.list_files(server_id, "/server/rust/oxide/logs")
-            log_files = sorted(
-                [f for f in files if f["is_file"]],
-                key=lambda f: f.get("modified_at", ""),
-                reverse=True,
-            )
-            return log_files[:limit]
-        except PterodactylAPIError:
-            return []
+        """List recent Oxide log files.
+
+        Discovers the actual Oxide directory structure dynamically,
+        then falls back to hardcoded path variations.
+        """
+        # Dynamic discovery
+        oxide_root = self._discover_oxide_root(server_id)
+        if oxide_root:
+            subdirs = self._discover_oxide_subdirs(server_id, oxide_root)
+            if "logs" in subdirs:
+                try:
+                    files = self.list_files(server_id, subdirs["logs"])
+                    log_files = sorted(
+                        [f for f in files if f["is_file"]],
+                        key=lambda f: f.get("modified_at", ""),
+                        reverse=True,
+                    )
+                    if log_files:
+                        return log_files[:limit]
+                except PterodactylAPIError:
+                    pass
+
+        # Fallback to hardcoded paths
+        log_paths = [
+            "/server/rust/oxide/logs",
+            "/server/rust/Oxide/Logs",
+            "/server/rust/Oxide/logs",
+            "/server/rust/oxide/Logs",
+        ]
+        for path in log_paths:
+            try:
+                files = self.list_files(server_id, path)
+                log_files = sorted(
+                    [f for f in files if f["is_file"]],
+                    key=lambda f: f.get("modified_at", ""),
+                    reverse=True,
+                )
+                if log_files:
+                    return log_files[:limit]
+            except PterodactylAPIError:
+                continue
+        return []

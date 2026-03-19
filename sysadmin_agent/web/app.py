@@ -329,6 +329,22 @@ def _build_server_context(sid: str) -> dict:
         ctx["architecture"] = os_info.get("architecture", "unknown")
         ctx["hostname"] = os_info.get("hostname", "unknown")
 
+    # CPU core count — important for interpreting %CPU values
+    cpu_cores = data.get("cpu_cores")
+    if not cpu_cores:
+        ssh = _get_ssh(sid)
+        if ssh:
+            try:
+                result = ssh.execute("nproc 2>/dev/null || grep -c ^processor /proc/cpuinfo")
+                cores = int(result["stdout"].strip())
+                if cores > 0:
+                    cpu_cores = cores
+                    data["cpu_cores"] = cores  # cache it
+            except Exception:
+                pass
+    if cpu_cores:
+        ctx["cpu_cores"] = cpu_cores
+
     apps = data.get("apps")
     if apps:
         web = [w.get("name", "") for w in apps.get("web_servers", [])]
@@ -384,6 +400,43 @@ def _build_server_context(sid: str) -> dict:
                 ctx[f"docs_{name}"] = json.dumps(doc) if not isinstance(doc, str) else doc
     except Exception:
         pass
+
+    # ------------------------------------------------------------------
+    # Rust / Game server context — critical for the AI to know what
+    # environment it is working with so it doesn't assume WordPress etc.
+    # ------------------------------------------------------------------
+    rcon = _rcon_connections.get(sid)
+    ptero_data = _ptero_connections.get(sid)
+    if rcon or ptero_data:
+        ctx["server_type"] = "Rust game server (Oxide/uMod modded)"
+        ctx["management"] = "Pterodactyl Panel + RCON"
+        if rcon:
+            ctx["rcon_connected"] = "yes"
+        if ptero_data:
+            ctx["pterodactyl_connected"] = "yes"
+            if ptero_data.get("server_id"):
+                ctx["pterodactyl_server_id"] = ptero_data["server_id"]
+        ctx["server_context_notes"] = (
+            "This is a Rust game server managed via Pterodactyl Panel, NOT a "
+            "web server or WordPress site. 'Plugins' means Oxide/uMod .cs plugins "
+            "(C# scripts), NOT WordPress plugins. 'Hook times' means Oxide plugin "
+            "hook execution times checked via the RCON 'perf' command. Use RCON "
+            "commands (oxide.plugins, oxide.reload, perf, status, serverinfo, etc.) "
+            "and Pterodactyl file API for diagnostics. Config files are in "
+            "/server/rust/cfg/ (server.cfg or serverauto.cfg). Oxide logs are in "
+            "oxide/logs or Oxide/Logs. Do NOT suggest WordPress, wp-cli, PHP, or "
+            "web-server commands for this server."
+        )
+
+    # Store last diagnostic results if available
+    sdata = _get_session_data(sid)
+    if "rust_diagnostics" in sdata:
+        diag_summary = []
+        for d in sdata.get("rust_diagnostics", []):
+            if d.get("status") != "ok":
+                diag_summary.append(f"{d['name']}: {d['status']} — {d.get('details', '')[:100]}")
+        if diag_summary:
+            ctx["rust_diagnostic_issues"] = "; ".join(diag_summary[:10])
 
     return ctx
 
@@ -537,8 +590,15 @@ def list_profiles():
     for name, prof in server_profiles.items():
         entry = dict(prof) if isinstance(prof, dict) else {}
         entry.setdefault("name", name)
-        # Remove the obfuscated password from the listing
+        # Remove obfuscated secrets from the listing
         entry.pop("password_obf", None)
+        entry.pop("rcon_password_obf", None)
+        entry.pop("ptero_api_key_obf", None)
+        # Tell the frontend which Rust fields are saved
+        if "rcon_password_obf" in prof:
+            entry["rcon_password_saved"] = True
+        if "ptero_api_key_obf" in prof:
+            entry["ptero_api_key_saved"] = True
         result.append(entry)
     return jsonify(result)
 
@@ -569,6 +629,32 @@ def save_profile():
         ).decode("ascii")
     elif data.get("auth_type") == "password":
         profile_data["password_required"] = True
+
+    # Handle Rust admin credentials (RCON + Pterodactyl)
+    import base64 as _b64
+
+    # Get existing profile for preserving saved secrets
+    existing_profile = server_profiles.get(name, {})
+
+    if data.get("rcon_password"):
+        profile_data["rcon_password_obf"] = _b64.b64encode(
+            data["rcon_password"].encode("utf-8")
+        ).decode("ascii")
+        profile_data.pop("rcon_password", None)
+    elif data.get("preserve_rcon_password") and existing_profile.get("rcon_password_obf"):
+        # Keep the existing saved RCON password
+        profile_data["rcon_password_obf"] = existing_profile["rcon_password_obf"]
+    profile_data.pop("preserve_rcon_password", None)
+
+    if data.get("ptero_api_key"):
+        profile_data["ptero_api_key_obf"] = _b64.b64encode(
+            data["ptero_api_key"].encode("utf-8")
+        ).decode("ascii")
+        profile_data.pop("ptero_api_key", None)
+    elif data.get("preserve_ptero_api_key") and existing_profile.get("ptero_api_key_obf"):
+        # Keep the existing saved Pterodactyl API key
+        profile_data["ptero_api_key_obf"] = existing_profile["ptero_api_key_obf"]
+    profile_data.pop("preserve_ptero_api_key", None)
 
     server_profiles[name] = profile_data
     _save_config(server_profiles)
@@ -764,21 +850,36 @@ def handle_connect_server(data):
         private_key_path = data.get("private_key_path") or data.get("key_path")
         passphrase = data.get("passphrase")
 
-        # If no password provided, check if there's a saved one in profiles
+        # If no password provided, check saved profiles for credentials
         if not password and not private_key_path:
             import base64
-            for _pname, prof in server_profiles.items():
-                if (isinstance(prof, dict)
-                        and prof.get("host") == host
-                        and prof.get("username", "") == username
-                        and prof.get("password_obf")):
+
+            # First try direct lookup by profile_name if provided
+            profile_name = data.get("profile_name", "")
+            prof = None
+            if profile_name and profile_name in server_profiles:
+                prof = server_profiles[profile_name]
+            else:
+                # Fall back to matching by host+username
+                for _pname, _prof in server_profiles.items():
+                    if (isinstance(_prof, dict)
+                            and _prof.get("host") == host
+                            and _prof.get("username", "") == username):
+                        prof = _prof
+                        break
+
+            if prof and isinstance(prof, dict):
+                # Check for saved password
+                if prof.get("password_obf"):
                     try:
                         password = base64.b64decode(
                             prof["password_obf"].encode("ascii")
                         ).decode("utf-8")
                     except Exception:
                         pass
-                    break
+                # Check for saved key path
+                if not password and prof.get("key_path"):
+                    private_key_path = prof["key_path"]
 
         emit("status", {"message": f"Connecting to {host}:{port}..."})
 
@@ -1004,7 +1105,38 @@ def handle_ask_agent(data):
                     })
                     continue
 
-            if step.get("destructive"):
+            command_type = step.get("command_type", "ssh")
+
+            if command_type == "rcon":
+                # Execute via RCON WebSocket connection
+                rcon = _rcon_connections.get(sid)
+                if not rcon:
+                    emit("step_result", {
+                        "step": step["step"],
+                        "command": command,
+                        "skipped": True,
+                        "reason": "No RCON connection available",
+                    })
+                    continue
+                try:
+                    # Use longer timeout for heavy commands
+                    heavy = {"entity.count", "server.save", "status",
+                             "serverinfo", "perf"}
+                    cmd_base = command.split()[0] if command else ""
+                    timeout = 120 if cmd_base in heavy else 30
+                    rcon_result = rcon.command(command, timeout=timeout)
+                    result = {
+                        "stdout": rcon_result or "(no output)",
+                        "stderr": "",
+                        "exit_code": 0,
+                    }
+                except Exception as exc:
+                    result = {
+                        "stdout": "",
+                        "stderr": str(exc),
+                        "exit_code": 1,
+                    }
+            elif step.get("destructive"):
                 result = ssh.execute_sudo(command)
             else:
                 result = ssh.execute(command)
@@ -1021,6 +1153,7 @@ def handle_ask_agent(data):
             emit("step_result", {
                 "step": step["step"],
                 "command": command,
+                "command_type": command_type,
                 "exit_code": result["exit_code"],
                 "stdout": result["stdout"],
                 "stderr": result["stderr"],
@@ -1351,7 +1484,8 @@ def do_restart():
     def _restart():
         import time as _time
         import signal
-        _time.sleep(1)
+        import socket as _socket
+        _time.sleep(0.5)
 
         # Close all SSH connections
         for sid, ssh in list(_ssh_connections.items()):
@@ -1361,13 +1495,71 @@ def do_restart():
                 pass
         _ssh_connections.clear()
 
-        # Stop the SocketIO/Flask server
+        # Close all RCON connections
+        for sid, rcon in list(_rcon_connections.items()):
+            try:
+                rcon.close()
+            except Exception:
+                pass
+        _rcon_connections.clear()
+
+        # Force-close the listening socket(s) to free the port.
+        # werkzeug stores the socket on the server object; walk up from
+        # the WSGI server to find it.
+        _freed = False
+        try:
+            # Flask-SocketIO with werkzeug uses socketio.server.eio
+            # but the actual TCP socket is on the werkzeug server.
+            # Find it via the werkzeug shutdown mechanism.
+            func = request.environ.get("werkzeug.server.shutdown")
+            if func:
+                func()
+                _freed = True
+        except Exception:
+            pass
+
+        # Stop SocketIO server
         try:
             socketio.stop()
         except Exception:
             pass
 
-        _time.sleep(1)
+        # Brute-force: find and close any socket bound to our port.
+        # This handles the case where socketio.stop() doesn't release
+        # the port in time.
+        port = int(os.environ.get("WEB_PORT", "5000"))
+        try:
+            # Try to close the fd by scanning /proc/self for the listening socket
+            import glob as _glob
+            for fd_path in _glob.glob("/proc/self/fd/*"):
+                try:
+                    fd_num = int(os.path.basename(fd_path))
+                    sock = _socket.fromfd(fd_num, _socket.AF_INET, _socket.SOCK_STREAM)
+                    try:
+                        addr = sock.getsockname()
+                        if addr[1] == port:
+                            sock.close()
+                            os.close(fd_num)
+                            _freed = True
+                    except (OSError, _socket.error):
+                        sock.detach()  # don't close if not our socket
+                except (ValueError, OSError):
+                    pass
+        except Exception:
+            pass
+
+        # Wait for port to actually be free
+        for _attempt in range(20):
+            try:
+                probe = _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM)
+                probe.setsockopt(_socket.SOL_SOCKET, _socket.SO_REUSEADDR, 1)
+                probe.bind(("0.0.0.0", port))
+                probe.close()
+                break  # Port is free
+            except OSError:
+                _time.sleep(0.5)
+        else:
+            logger.warning("Port %d still in use after 10s, exec-ing anyway", port)
 
         # Re-exec the process
         os.execv(sys.executable, [sys.executable] + sys.argv)
@@ -1387,6 +1579,15 @@ def handle_rust_connect_rcon(data):
     host = (data.get("host") or "").strip()
     port = data.get("port", 28016)
     password = (data.get("password") or "").strip()
+
+    # Look up saved RCON password from profile if requested
+    if not password and data.get("use_saved_password"):
+        profile_name = data.get("profile_name", "")
+        profile = server_profiles.get(profile_name, {})
+        obf = profile.get("rcon_password_obf", "")
+        if obf:
+            import base64
+            password = base64.b64decode(obf).decode("utf-8")
 
     if not host or not password:
         emit("error", {"message": "RCON host and password are required."})
@@ -1433,6 +1634,15 @@ def handle_rust_connect_pterodactyl(data):
     api_key = (data.get("api_key") or "").strip()
     server_id = (data.get("server_id") or "").strip()
 
+    # Look up saved API key from profile if requested
+    if not api_key and data.get("use_saved_key"):
+        profile_name = data.get("profile_name", "")
+        profile = server_profiles.get(profile_name, {})
+        obf = profile.get("ptero_api_key_obf", "")
+        if obf:
+            import base64
+            api_key = base64.b64decode(obf).decode("utf-8")
+
     if not base_url or not api_key:
         emit("error", {"message": "Panel URL and API key are required."})
         return
@@ -1460,11 +1670,31 @@ def handle_rust_connect_pterodactyl(data):
         if not resolved_id and len(servers) == 1:
             resolved_id = servers[0]["identifier"]
 
-        _ptero_connections[sid] = {"api": ptero, "server_id": resolved_id}
-        emit("rust_ptero_connected", {
+        # Store server limits (CPU, memory) for diagnostics
+        server_limits = {}
+        for s in servers:
+            if s.get("identifier") == resolved_id:
+                server_limits = s.get("limits", {})
+                break
+
+        _ptero_connections[sid] = {
+            "api": ptero,
+            "server_id": resolved_id,
+            "limits": server_limits,
+        }
+
+        result = {
             "servers": servers,
             "selected_server": resolved_id,
-        })
+            "client_api": ptero._client_api_available,
+        }
+        if not ptero._client_api_available:
+            result["warning"] = (
+                "Connected with Application API key (ptla_). "
+                "Server management (files, console, power) requires a "
+                "Client API key (ptlc_). Create one under Account > API Credentials."
+            )
+        emit("rust_ptero_connected", result)
     except Exception as exc:
         logger.exception("Pterodactyl connect failed")
         emit("error", {"message": f"Pterodactyl connection failed: {exc}"})
@@ -1562,8 +1792,18 @@ def handle_rust_run_diagnostics(data=None):
         from sysadmin_agent.rust.rust_diagnostics import RustServerDiagnostics
 
         emit("status", {"message": "Running Rust server diagnostics..."})
-        diag = RustServerDiagnostics(rcon, ptero=ptero, server_id=server_id, ssh=ssh)
+
+        def progress_cb(msg):
+            emit("status", {"message": msg})
+
+        server_limits = ptero_data.get("limits", {}) if ptero_data else {}
+        diag = RustServerDiagnostics(rcon, ptero=ptero, server_id=server_id,
+                                     ssh=ssh, on_progress=progress_cb,
+                                     server_limits=server_limits)
         results = diag.run_all()
+
+        # Store results in session for AI context awareness
+        _get_session_data(sid)["rust_diagnostics"] = results
 
         emit("rust_diagnostics_result", {"diagnostics": results})
     except Exception as exc:
@@ -1590,7 +1830,14 @@ def handle_rust_diagnose_lag(data=None):
         from sysadmin_agent.rust.rust_diagnostics import RustServerDiagnostics
 
         emit("status", {"message": "Diagnosing lag and rubber-banding..."})
-        diag = RustServerDiagnostics(rcon, ptero=ptero, server_id=server_id, ssh=ssh)
+
+        def progress_cb(msg):
+            emit("status", {"message": msg})
+
+        server_limits = ptero_data.get("limits", {}) if ptero_data else {}
+        diag = RustServerDiagnostics(rcon, ptero=ptero, server_id=server_id,
+                                     ssh=ssh, on_progress=progress_cb,
+                                     server_limits=server_limits)
         results = diag.run_lag_diagnosis()
 
         emit("rust_lag_result", {"diagnosis": results})
@@ -1622,7 +1869,9 @@ def handle_rust_plugin_action(data):
 
         ptero = ptero_data["api"] if ptero_data else None
         server_id = ptero_data.get("server_id") if ptero_data else None
-        diag = RustServerDiagnostics(rcon, ptero=ptero, server_id=server_id)
+        server_limits = ptero_data.get("limits", {}) if ptero_data else {}
+        diag = RustServerDiagnostics(rcon, ptero=ptero, server_id=server_id,
+                                     server_limits=server_limits)
 
         if action == "reload":
             result = diag.reload_plugin(plugin_name)
@@ -1945,10 +2194,31 @@ def create_app() -> tuple[Flask, SocketIO]:
 
 def main():
     """Run the development server."""
+    import socket as _socket
+
     host = os.environ.get("WEB_HOST", "127.0.0.1")
     port = int(os.environ.get("WEB_PORT", "5000"))
     debug = os.environ.get("WEB_DEBUG", "0").lower() in ("1", "true", "yes")
     logger.info("Starting sysadmin-agent web UI on %s:%s", host, port)
+
+    # Patch werkzeug to set SO_REUSEADDR+SO_REUSEPORT so restarts don't
+    # fail with "Address already in use" during TIME_WAIT.
+    try:
+        from werkzeug.serving import BaseWSGIServer
+        _orig_init = BaseWSGIServer.server_bind
+
+        def _patched_bind(self):
+            self.socket.setsockopt(_socket.SOL_SOCKET, _socket.SO_REUSEADDR, 1)
+            try:
+                self.socket.setsockopt(_socket.SOL_SOCKET, _socket.SO_REUSEPORT, 1)
+            except (AttributeError, OSError):
+                pass  # SO_REUSEPORT not available on all platforms
+            return _orig_init(self)
+
+        BaseWSGIServer.server_bind = _patched_bind
+    except Exception:
+        pass
+
     socketio.run(app, host=host, port=port, debug=debug, allow_unsafe_werkzeug=True)
 
 
