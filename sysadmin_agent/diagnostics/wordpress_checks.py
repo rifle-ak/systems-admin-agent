@@ -27,6 +27,11 @@ class WordPressChecker:
             self.check_page_speed_factors,
             self.check_security_basics,
             self.check_elementor_health,
+            self.check_debug_log,
+            self.check_rest_api_health,
+            self.check_cron_events,
+            self.check_cache_dynamic_conflicts,
+            self.check_plugin_errors,
         ]
 
     # ------------------------------------------------------------------ #
@@ -1197,11 +1202,659 @@ class WordPressChecker:
         return self._ok(name, "\n".join(details_parts))
 
     # ------------------------------------------------------------------ #
+    # 16. Debug log analysis
+    # ------------------------------------------------------------------ #
+
+    def check_debug_log(self):
+        """Check wp-content/debug.log for recent PHP errors/warnings that
+        reveal plugin failures, fatal errors, or deprecation issues."""
+        name = "check_debug_log"
+        sp = self.site_path
+        log_path = f"{sp}/wp-content/debug.log"
+
+        # Check if debug.log exists and its size
+        size_result = self.ssh.execute(
+            f"test -f {log_path} && stat -c '%s' {log_path} 2>/dev/null || echo 'missing'"
+        )
+        if size_result["stdout"].strip() == "missing":
+            return self._ok(name, "No debug.log found (WP_DEBUG_LOG may be disabled)")
+
+        try:
+            log_size = int(size_result["stdout"].strip())
+        except ValueError:
+            return self._error(name, "Could not determine debug.log size")
+
+        size_mb = log_size / (1024 * 1024)
+        details_parts = [f"debug.log size: {size_mb:.1f}MB"]
+
+        if size_mb > 50:
+            details_parts.append("WARNING: debug.log is very large — consider rotating or truncating")
+
+        # Get the last 200 lines and analyze for recent errors
+        tail_result = self.ssh.execute(f"tail -n 200 {log_path} 2>/dev/null")
+        if tail_result["exit_code"] != 0:
+            return self._error(name, f"Cannot read debug.log: {tail_result['stderr']}")
+
+        lines = tail_result["stdout"].strip().splitlines()
+        if not lines:
+            return self._ok(name, "debug.log exists but is empty")
+
+        # Categorize errors
+        fatal_errors = []
+        warnings = []
+        notices = []
+        plugin_errors = {}  # plugin_name -> [error_lines]
+
+        for line in lines:
+            lower = line.lower()
+            # Extract plugin name from path references
+            plugin_match = re.search(
+                r'/wp-content/plugins/([^/]+)/', line
+            )
+            plugin_name = plugin_match.group(1) if plugin_match else None
+
+            if "fatal error" in lower or "uncaught error" in lower:
+                fatal_errors.append(line.strip()[:200])
+                if plugin_name:
+                    plugin_errors.setdefault(plugin_name, []).append("FATAL: " + line.strip()[:150])
+            elif "warning" in lower and "php warning" in lower:
+                warnings.append(line.strip()[:200])
+                if plugin_name:
+                    plugin_errors.setdefault(plugin_name, []).append("WARNING: " + line.strip()[:150])
+            elif "deprecated" in lower:
+                if plugin_name:
+                    plugin_errors.setdefault(plugin_name, []).append("DEPRECATED: " + line.strip()[:150])
+            elif "notice" in lower:
+                notices.append(line.strip()[:200])
+
+        if fatal_errors:
+            details_parts.append(f"\nFatal errors ({len(fatal_errors)} recent):")
+            for err in fatal_errors[-5:]:
+                details_parts.append(f"  {err}")
+
+        if warnings:
+            details_parts.append(f"\nPHP warnings ({len(warnings)} recent):")
+            for w in warnings[-5:]:
+                details_parts.append(f"  {w}")
+
+        if plugin_errors:
+            details_parts.append(f"\nPlugins with errors ({len(plugin_errors)}):")
+            for pname, errs in sorted(plugin_errors.items()):
+                details_parts.append(f"  {pname}: {len(errs)} error(s)")
+                for e in errs[-2:]:
+                    details_parts.append(f"    {e}")
+
+        if fatal_errors:
+            return {
+                "name": name,
+                "status": "critical",
+                "severity": "high",
+                "details": "\n".join(details_parts),
+                "fix": [
+                    {
+                        "command": f"tail -n 50 {log_path}",
+                        "description": "Show last 50 lines of debug.log for detailed review",
+                        "destructive": False,
+                    },
+                ],
+            }
+
+        if warnings or plugin_errors:
+            return {
+                "name": name,
+                "status": "warning",
+                "severity": "medium",
+                "details": "\n".join(details_parts),
+                "fix": None,
+            }
+
+        return self._ok(name, "\n".join(details_parts) + "\nNo significant errors in recent log entries")
+
+    # ------------------------------------------------------------------ #
+    # 17. REST API health
+    # ------------------------------------------------------------------ #
+
+    def check_rest_api_health(self):
+        """Verify the WP REST API is functional — many modern plugins
+        (calendars, form builders, page builders) depend on it."""
+        name = "check_rest_api_health"
+        cli = self._detect_wp_cli()
+        details_parts = []
+        issues = []
+
+        # Get site URL for REST API testing
+        siteurl = None
+        if cli:
+            url_result = self._wp("option get siteurl")
+            if url_result and url_result["exit_code"] == 0:
+                siteurl = url_result["stdout"].strip()
+
+        # Test REST API endpoint locally via curl
+        if siteurl:
+            # Test the base REST API endpoint
+            api_result = self.ssh.execute(
+                f"curl -sS -o /dev/null -w '%{{http_code}}' "
+                f"--max-time 10 -H 'Host: {siteurl.replace('https://', '').replace('http://', '').split('/')[0]}' "
+                f"'{siteurl}/wp-json/wp/v2/types' 2>&1"
+            )
+            if api_result["exit_code"] == 0:
+                status_code = api_result["stdout"].strip()
+                details_parts.append(f"REST API /wp/v2/types: HTTP {status_code}")
+                if status_code == "200":
+                    pass  # good
+                elif status_code == "401" or status_code == "403":
+                    issues.append(
+                        f"REST API returned {status_code} — may be blocked by a security plugin "
+                        "(this breaks calendar plugins, form builders, and any AJAX-based content)"
+                    )
+                elif status_code == "404":
+                    issues.append(
+                        "REST API returned 404 — rewrite rules may be broken. "
+                        "Try flushing permalinks (Settings > Permalinks > Save)"
+                    )
+                elif status_code == "500":
+                    issues.append(
+                        "REST API returned 500 — server error. Check debug.log for PHP fatal errors"
+                    )
+                elif status_code == "000":
+                    issues.append("REST API request timed out or failed to connect")
+                else:
+                    issues.append(f"REST API returned unexpected status {status_code}")
+            else:
+                details_parts.append(f"REST API test failed: {api_result['stderr']}")
+                issues.append("Could not reach REST API endpoint via curl")
+
+            # Test admin-ajax.php (fallback for many plugins)
+            ajax_result = self.ssh.execute(
+                f"curl -sS -o /dev/null -w '%{{http_code}}' "
+                f"--max-time 10 '{siteurl}/wp-admin/admin-ajax.php' 2>&1"
+            )
+            if ajax_result["exit_code"] == 0:
+                ajax_code = ajax_result["stdout"].strip()
+                details_parts.append(f"admin-ajax.php: HTTP {ajax_code}")
+                if ajax_code == "400":
+                    details_parts.append("  (400 is expected with no action parameter — endpoint is working)")
+                elif ajax_code == "500":
+                    issues.append("admin-ajax.php returned 500 — AJAX-dependent plugins will fail")
+                elif ajax_code in ("403", "401"):
+                    issues.append(
+                        f"admin-ajax.php returned {ajax_code} — may be blocked by .htaccess or security plugin"
+                    )
+        else:
+            details_parts.append("Could not determine site URL — skipping REST API test")
+
+        # Check if REST API is disabled via filters
+        if cli:
+            rest_disabled_result = self._wp(
+                "eval 'echo has_filter(\"rest_authentication_errors\") ? \"filtered\" : \"open\";' 2>/dev/null"
+            )
+            if rest_disabled_result and rest_disabled_result["exit_code"] == 0:
+                val = rest_disabled_result["stdout"].strip()
+                if val == "filtered":
+                    details_parts.append("REST API has authentication filters applied")
+                    issues.append(
+                        "REST API authentication filters detected — a security plugin may be "
+                        "blocking unauthenticated REST requests. This can break calendar/event "
+                        "plugins that load content via AJAX"
+                    )
+
+        # Check .htaccess for REST API blocking
+        htaccess_result = self.ssh.execute(
+            f"grep -i 'wp-json\\|rest_route' {self.site_path}/.htaccess 2>/dev/null"
+        )
+        if htaccess_result["stdout"].strip():
+            block_lines = htaccess_result["stdout"].strip()
+            if "deny" in block_lines.lower() or "rewriterule" in block_lines.lower():
+                issues.append(
+                    ".htaccess contains rules targeting wp-json/REST API — "
+                    "this may block plugin AJAX functionality"
+                )
+                details_parts.append(f".htaccess REST rules:\n  {block_lines[:200]}")
+
+        if issues:
+            return {
+                "name": name,
+                "status": "critical" if any("500" in i or "blocked" in i.lower() for i in issues) else "warning",
+                "severity": "high",
+                "details": "\n".join(details_parts) + "\n\nIssues:\n" + "\n".join(f"  - {i}" for i in issues),
+                "fix": [
+                    {
+                        "command": f"{cli or 'wp'} rewrite flush --path={self.site_path}",
+                        "description": "Flush rewrite rules (fixes 404 on REST API)",
+                        "destructive": True,
+                    },
+                ] if cli else None,
+            }
+
+        return self._ok(name, "\n".join(details_parts))
+
+    # ------------------------------------------------------------------ #
+    # 18. WP-Cron scheduled events health
+    # ------------------------------------------------------------------ #
+
+    def check_cron_events(self):
+        """Check for stuck, overdue, or failing cron events — critical for
+        plugins that rely on scheduled tasks (calendars, forms, caching)."""
+        name = "check_cron_events"
+        cli = self._detect_wp_cli()
+        if cli is None:
+            return self._wp_cli_missing_result(name)
+
+        details_parts = []
+        issues = []
+
+        # List cron events
+        cron_result = self._wp("cron event list --format=json 2>/dev/null", timeout=15)
+        if cron_result is None or cron_result["exit_code"] != 0:
+            return {
+                "name": name,
+                "status": "info",
+                "severity": "low",
+                "details": "Could not list cron events (wp cron event list failed)",
+                "fix": None,
+            }
+
+        try:
+            events = json.loads(cron_result["stdout"])
+        except (json.JSONDecodeError, ValueError):
+            return self._error(name, "Failed to parse cron event list JSON")
+
+        total_events = len(events)
+        details_parts.append(f"Total scheduled events: {total_events}")
+
+        if total_events > 100:
+            issues.append(
+                f"{total_events} cron events registered — this is unusually high "
+                "and may indicate stuck/orphaned events from plugins"
+            )
+
+        # Check for overdue events (past their scheduled time by > 10 minutes)
+        import time as _time
+        now = _time.time()
+        overdue = []
+        for event in events:
+            next_run = event.get("time") or event.get("next_run_gmt") or event.get("next_run")
+            if next_run:
+                # wp-cli may return a unix timestamp or a date string
+                try:
+                    ts = float(next_run)
+                except (ValueError, TypeError):
+                    continue
+                if ts < (now - 600):  # more than 10 minutes overdue
+                    hook = event.get("hook", "unknown")
+                    overdue_minutes = int((now - ts) / 60)
+                    overdue.append(f"{hook} (overdue by {overdue_minutes}min)")
+
+        if overdue:
+            details_parts.append(f"\nOverdue events ({len(overdue)}):")
+            for o in overdue[:10]:
+                details_parts.append(f"  - {o}")
+            if len(overdue) > 10:
+                details_parts.append(f"  ... and {len(overdue) - 10} more")
+            issues.append(
+                f"{len(overdue)} cron event(s) are overdue — WP-Cron may not be firing. "
+                "Plugins relying on scheduled tasks (event calendars, email notifications, "
+                "cache preloading) will not work correctly"
+            )
+
+        # Check for specific plugin hooks that indicate calendar/event systems
+        calendar_hooks = [h for h in [e.get("hook", "") for e in events]
+                          if any(kw in h.lower() for kw in
+                                 ["calendar", "event", "cmcal", "tribe", "booking",
+                                  "schedule", "reminder", "notification"])]
+        if calendar_hooks:
+            details_parts.append(f"\nCalendar/event related cron hooks: {', '.join(set(calendar_hooks)[:10])}")
+
+        # Test if WP-Cron is actually executable
+        cron_test = self._wp("cron test 2>/dev/null", timeout=15)
+        if cron_test and cron_test["exit_code"] == 0:
+            test_output = cron_test["stdout"].strip()
+            details_parts.append(f"Cron test: {test_output}")
+            if "error" in test_output.lower():
+                issues.append(f"WP-Cron test reported issues: {test_output}")
+        elif cron_test:
+            stderr = cron_test.get("stderr", "").strip()
+            if stderr:
+                issues.append(f"WP-Cron test failed: {stderr[:200]}")
+
+        if issues:
+            fix_actions = [
+                {
+                    "command": f"{cli} cron event run --due-now --path={self.site_path}",
+                    "description": "Run all overdue cron events now",
+                    "destructive": True,
+                },
+            ]
+            return {
+                "name": name,
+                "status": "warning",
+                "severity": "high" if overdue else "medium",
+                "details": "\n".join(details_parts) + "\n\nIssues:\n" + "\n".join(f"  - {i}" for i in issues),
+                "fix": fix_actions,
+            }
+
+        return self._ok(name, "\n".join(details_parts))
+
+    # ------------------------------------------------------------------ #
+    # 19. Cache vs. dynamic content conflicts
+    # ------------------------------------------------------------------ #
+
+    def check_cache_dynamic_conflicts(self):
+        """Detect caching configurations that conflict with dynamic content
+        plugins (calendars, booking systems, WooCommerce, form builders).
+        Aggressive page caching is the #1 cause of 'content not showing'
+        on sites with dynamic plugins."""
+        name = "check_cache_dynamic_conflicts"
+        cli = self._detect_wp_cli()
+        details_parts = []
+        issues = []
+
+        # Identify dynamic content plugins that are cache-sensitive
+        dynamic_plugins = {}
+        DYNAMIC_PLUGIN_PATTERNS = {
+            "cm-multi": "CM MultiView Calendar",
+            "cm-calendar": "CM Calendar",
+            "events-calendar": "The Events Calendar",
+            "tribe-events": "The Events Calendar (Tribe)",
+            "modern-events": "Modern Events Calendar",
+            "booking": "Booking plugin",
+            "woocommerce": "WooCommerce",
+            "wp-e-commerce": "WP eCommerce",
+            "contact-form-7": "Contact Form 7",
+            "wpforms": "WPForms",
+            "gravityforms": "Gravity Forms",
+            "bbpress": "bbPress (forums)",
+            "buddypress": "BuddyPress",
+            "memberpress": "MemberPress",
+            "restrict-content": "Restrict Content",
+            "learndash": "LearnDash",
+            "lifterlms": "LifterLMS",
+            "all-in-one-event": "All-in-One Event Calendar",
+            "sugar-calendar": "Sugar Calendar",
+            "simple-calendar": "Simple Calendar",
+            "calendarize-it": "Calendarize it!",
+            "eventbrite": "Eventbrite",
+        }
+
+        if cli:
+            plugin_result = self._wp("plugin list --status=active --format=json")
+            if plugin_result and plugin_result["exit_code"] == 0:
+                try:
+                    active = json.loads(plugin_result["stdout"])
+                    active_names = [p.get("name", "") for p in active]
+                    for pname in active_names:
+                        for pattern, label in DYNAMIC_PLUGIN_PATTERNS.items():
+                            if pattern in pname.lower():
+                                dynamic_plugins[pname] = label
+                except (json.JSONDecodeError, ValueError):
+                    pass
+
+        if dynamic_plugins:
+            details_parts.append("Dynamic content plugins detected:")
+            for slug, label in dynamic_plugins.items():
+                details_parts.append(f"  - {label} ({slug})")
+
+        # Identify active caching plugins and their settings
+        CACHE_PLUGINS = {
+            "wp-super-cache": "WP Super Cache",
+            "w3-total-cache": "W3 Total Cache",
+            "wp-rocket": "WP Rocket",
+            "litespeed-cache": "LiteSpeed Cache",
+            "wp-fastest-cache": "WP Fastest Cache",
+            "sg-cachepress": "SG Optimizer",
+            "breeze": "Breeze",
+            "cache-enabler": "Cache Enabler",
+            "hummingbird-performance": "Hummingbird",
+            "comet-cache": "Comet Cache",
+            "powered-cache": "Powered Cache",
+        }
+        active_cache_plugins = []
+
+        if cli:
+            if plugin_result and plugin_result["exit_code"] == 0:
+                try:
+                    active = json.loads(plugin_result["stdout"])
+                    active_names = [p.get("name", "") for p in active]
+                    for pname in active_names:
+                        for pattern, label in CACHE_PLUGINS.items():
+                            if pattern in pname.lower():
+                                active_cache_plugins.append(label)
+                except (json.JSONDecodeError, ValueError):
+                    pass
+
+        if active_cache_plugins:
+            details_parts.append(f"\nCaching plugins: {', '.join(active_cache_plugins)}")
+
+        # If dynamic plugins + caching = check for exclusions
+        if dynamic_plugins and active_cache_plugins:
+            # Check for known cache exclusion patterns
+            sp = self.site_path
+
+            # Check wp-config.php for cache exclusion constants
+            config_result = self.ssh.execute(f"cat {sp}/wp-config.php 2>/dev/null")
+            has_exclusions = False
+            if config_result["exit_code"] == 0:
+                content = config_result["stdout"]
+                if "DONOTCACHEPAGE" in content:
+                    details_parts.append("DONOTCACHEPAGE constant found in wp-config.php")
+                    has_exclusions = True
+
+            # Check for cache exclusion in common cache plugin configs
+            # WP Rocket
+            if cli:
+                rocket_excludes = self._wp(
+                    "option get wp_rocket_settings --format=json 2>/dev/null"
+                )
+                if rocket_excludes and rocket_excludes["exit_code"] == 0:
+                    try:
+                        settings = json.loads(rocket_excludes["stdout"])
+                        cache_reject_uri = settings.get("cache_reject_uri", [])
+                        if cache_reject_uri:
+                            details_parts.append(f"WP Rocket cache exclusions: {len(cache_reject_uri)} URI pattern(s)")
+                            has_exclusions = True
+                        else:
+                            issues.append(
+                                "WP Rocket has no page cache exclusions — dynamic content pages "
+                                "(calendar, events, booking) may be served from cache with stale content"
+                            )
+                    except (json.JSONDecodeError, ValueError):
+                        pass
+
+            if not has_exclusions:
+                issues.append(
+                    "Dynamic content plugins detected alongside page caching, but no cache "
+                    "exclusions found. Pages with calendars, event listings, or booking forms "
+                    "may show stale/missing content. Exclude those pages from full-page cache "
+                    "or enable AJAX-based content loading in the plugin settings"
+                )
+
+        # Check server-level caching (Varnish, Nginx fastcgi_cache)
+        varnish_result = self.ssh.execute(
+            "systemctl is-active varnish 2>/dev/null; "
+            "curl -sI http://127.0.0.1 2>/dev/null | grep -i 'X-Varnish\\|Via.*varnish'"
+        )
+        if "active" in varnish_result.get("stdout", "") or "varnish" in varnish_result.get("stdout", "").lower():
+            details_parts.append("Varnish cache detected (server-level)")
+            if dynamic_plugins:
+                issues.append(
+                    "Varnish is active — ensure dynamic pages (calendar, events) are excluded "
+                    "from Varnish cache via VCL rules or DONOTCACHEPAGE header"
+                )
+
+        nginx_cache = self.ssh.execute(
+            "grep -rl 'fastcgi_cache\\|proxy_cache' /etc/nginx/ 2>/dev/null | head -3"
+        )
+        if nginx_cache.get("stdout", "").strip():
+            details_parts.append("Nginx caching detected (fastcgi_cache or proxy_cache)")
+            if dynamic_plugins:
+                issues.append(
+                    "Nginx page caching is active — dynamic pages may be cached. "
+                    "Add cache bypass rules for pages with calendars/events"
+                )
+
+        # Check for CDN-level caching (Cloudflare page rules)
+        if cli:
+            cf_check = self._wp("option get siteurl 2>/dev/null")
+            if cf_check and cf_check["exit_code"] == 0:
+                url = cf_check["stdout"].strip()
+                # Quick header check for Cloudflare
+                cf_header = self.ssh.execute(
+                    f"curl -sI --max-time 5 '{url}' 2>/dev/null | grep -i 'cf-cache-status'"
+                )
+                if cf_header.get("stdout", "").strip():
+                    cf_status = cf_header["stdout"].strip()
+                    details_parts.append(f"Cloudflare: {cf_status}")
+                    if "HIT" in cf_status.upper() and dynamic_plugins:
+                        issues.append(
+                            "Cloudflare is caching HTML pages — dynamic content (calendars, events) "
+                            "will show stale data. Create a Page Rule to bypass cache for "
+                            "pages with dynamic content, or set Cache-Control: no-cache headers"
+                        )
+
+        if not dynamic_plugins and not issues:
+            return self._ok(name, "No dynamic content plugins detected — cache conflict check not applicable")
+
+        if issues:
+            return {
+                "name": name,
+                "status": "warning",
+                "severity": "high",
+                "details": "\n".join(details_parts) + "\n\nIssues:\n" + "\n".join(f"  - {i}" for i in issues),
+                "fix": None,
+            }
+
+        return self._ok(name, "\n".join(details_parts) + "\n\nNo cache conflicts detected")
+
+    # ------------------------------------------------------------------ #
+    # 20. Plugin errors and conflict detection
+    # ------------------------------------------------------------------ #
+
+    def check_plugin_errors(self):
+        """Detect broken plugins, version incompatibilities, missing
+        dependencies, and JavaScript errors that cause display failures."""
+        name = "check_plugin_errors"
+        cli = self._detect_wp_cli()
+        sp = self.site_path
+        details_parts = []
+        issues = []
+
+        # Check for must-use plugins that might interfere
+        mu_result = self.ssh.execute(f"ls {sp}/wp-content/mu-plugins/ 2>/dev/null")
+        if mu_result["exit_code"] == 0 and mu_result["stdout"].strip():
+            mu_plugins = [f.strip() for f in mu_result["stdout"].strip().splitlines() if f.strip().endswith(".php")]
+            if mu_plugins:
+                details_parts.append(f"Must-use plugins ({len(mu_plugins)}): {', '.join(mu_plugins[:10])}")
+
+        if cli is None:
+            return self._wp_cli_missing_result(name)
+
+        # Check for plugins with PHP errors on activation
+        verify_result = self._wp("plugin list --format=json", timeout=15)
+        if verify_result and verify_result["exit_code"] == 0:
+            try:
+                plugins = json.loads(verify_result["stdout"])
+            except (json.JSONDecodeError, ValueError):
+                return self._error(name, "Failed to parse plugin list")
+
+            # Detect plugins in error state
+            for p in plugins:
+                status = p.get("status", "")
+                pname = p.get("name", "?")
+                if status == "dropin":
+                    continue
+                # Check for "active" plugins that have missing files
+                if status == "active":
+                    main_file = f"{sp}/wp-content/plugins/{pname}/{pname}.php"
+                    alt_file = f"{sp}/wp-content/plugins/{pname}"
+                    exists_result = self.ssh.execute(
+                        f"test -f {main_file} -o -d {alt_file} && echo 'ok' || echo 'missing'"
+                    )
+                    if exists_result["stdout"].strip() == "missing":
+                        issues.append(
+                            f"Plugin '{pname}' is marked active but its files appear missing — "
+                            "this will cause PHP fatal errors"
+                        )
+
+            # Check PHP compatibility
+            php_ver_result = self.ssh.execute(
+                "php -r \"echo PHP_VERSION;\" 2>/dev/null"
+            )
+            php_version = php_ver_result["stdout"].strip() if php_ver_result["exit_code"] == 0 else None
+            if php_version:
+                details_parts.append(f"PHP version: {php_version}")
+                # Check for known PHP 8.x incompatibility patterns in active plugins
+                if php_version.startswith("8."):
+                    compat_result = self.ssh.execute(
+                        f"grep -rl 'create_function\\|each(\\$\\|mysql_connect\\|ereg(' "
+                        f"{sp}/wp-content/plugins/*/  2>/dev/null | "
+                        f"head -10"
+                    )
+                    if compat_result["stdout"].strip():
+                        compat_files = compat_result["stdout"].strip().splitlines()
+                        affected_plugins = set()
+                        for f in compat_files:
+                            pmatch = re.search(r'/plugins/([^/]+)/', f)
+                            if pmatch:
+                                affected_plugins.add(pmatch.group(1))
+                        if affected_plugins:
+                            issues.append(
+                                f"PHP {php_version} incompatibility risk in plugins: "
+                                f"{', '.join(sorted(affected_plugins)[:5])} — "
+                                "these use deprecated PHP functions that may cause fatal errors"
+                            )
+
+            # Check for duplicate functionality (multiple SEO, cache, or security plugins)
+            active = [p for p in plugins if p.get("status") == "active"]
+            active_names = [p.get("name", "") for p in active]
+
+            seo_plugins = [n for n in active_names if any(kw in n.lower() for kw in
+                           ["yoast", "rank-math", "all-in-one-seo", "seo-framework", "seopress"])]
+            if len(seo_plugins) > 1:
+                issues.append(f"Multiple SEO plugins active: {', '.join(seo_plugins)} — these will conflict")
+
+            security_plugins = [n for n in active_names if any(kw in n.lower() for kw in
+                                ["wordfence", "sucuri", "ithemes-security", "all-in-one-wp-security",
+                                 "bulletproof", "shield-security"])]
+            if len(security_plugins) > 1:
+                issues.append(f"Multiple security plugins active: {', '.join(security_plugins)} — these may conflict and block REST API/AJAX")
+
+            details_parts.append(f"Active plugins: {len(active)}")
+
+        # Check for JavaScript errors by looking at enqueue issues
+        if cli:
+            # Check if jQuery is loading properly (many plugins depend on it)
+            jquery_result = self._wp(
+                "eval 'echo wp_scripts()->registered[\"jquery\"]->ver ?? \"missing\";' 2>/dev/null"
+            )
+            if jquery_result and jquery_result["exit_code"] == 0:
+                jq_ver = jquery_result["stdout"].strip()
+                if jq_ver and jq_ver != "missing":
+                    details_parts.append(f"jQuery version: {jq_ver}")
+                elif jq_ver == "missing":
+                    issues.append("jQuery does not appear to be registered — many plugins will fail")
+
+        # Check wp-content for error indicators
+        error_html = self.ssh.execute(
+            f"grep -r 'wp_die\\|wp_mail.*error' {sp}/wp-content/plugins/*/includes/ 2>/dev/null | wc -l"
+        )
+
+        if issues:
+            return {
+                "name": name,
+                "status": "critical" if any("fatal" in i.lower() or "missing" in i.lower() for i in issues) else "warning",
+                "severity": "high",
+                "details": "\n".join(details_parts) + "\n\nIssues:\n" + "\n".join(f"  - {i}" for i in issues),
+                "fix": None,
+            }
+
+        return self._ok(name, "\n".join(details_parts) + "\nNo plugin conflicts detected")
+
+    # ------------------------------------------------------------------ #
     # Run all checks
     # ------------------------------------------------------------------ #
 
     def run_all(self):
-        """Run all 15 checks in parallel where safe, return list of results."""
+        """Run all checks in parallel where safe, return list of results."""
         results = []
         with ThreadPoolExecutor(max_workers=8) as executor:
             futures = {executor.submit(check): check.__name__ for check in self._checks}
