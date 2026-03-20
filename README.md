@@ -127,7 +127,36 @@ python3 -m sysadmin_agent web --web-port 5000
 
 Open `http://your-server-ip:5000` in your browser.
 
-> **Firewall note:** Make sure port 5000 is open, or use `--web-port 80` if port 80 is free. For production, consider putting it behind Nginx with SSL.
+> **Firewall note:** Make sure port 5000 is open, or use `--web-port 80` if port 80 is free. For production, use the automated setup below.
+
+#### Production Deployment (Apache + HTTPS + systemd)
+
+For a production setup with HTTPS, a reverse proxy, and auto-start on boot:
+
+```bash
+sudo bash deploy/setup-domain.sh
+```
+
+This script:
+1. Installs Python dependencies
+2. Enables required Apache modules (`proxy`, `proxy_http`, `proxy_wstunnel`, `headers`, `ssl`, `rewrite`)
+3. Obtains an SSL certificate via Let's Encrypt (certbot)
+4. Installs the Apache reverse proxy config (auto-detects server IP for cPanel compatibility)
+5. Installs and enables a systemd service
+6. Starts the web UI
+
+Before running, edit the variables at the top of the script to match your setup:
+```bash
+DOMAIN="your-domain.com"
+APP_USER="your-username"
+```
+
+After setup, manage the service with:
+```bash
+systemctl status sysadmin-agent     # Check status
+systemctl restart sysadmin-agent    # Restart
+journalctl -u sysadmin-agent -f     # View logs
+```
 
 ---
 
@@ -374,6 +403,42 @@ The agent minimizes API costs by:
 - Condensing conversation history into summaries instead of sending full transcripts
 - Only calling Claude when plain English interpretation or complex analysis is needed
 - Tracking and displaying token usage after every session
+
+---
+
+## Deployment Troubleshooting
+
+### "Index of" or cPanel default page instead of the web UI
+
+This means Apache is not proxying to the app. Common causes:
+
+1. **App not running** — Verify with: `curl -s http://127.0.0.1:5000/` (should return HTML)
+2. **Wrong VirtualHost IP** — On cPanel/WHM servers, vhosts must be bound to the server's IP, not `*`. Run `apachectl -S` to see what IP other vhosts use, then update your config:
+   ```bash
+   sed -i 's/\*:80/YOUR_IP:80/' /etc/apache2/conf.d/sysadmin-agent.conf
+   sed -i 's/\*:443/YOUR_IP:443/' /etc/apache2/conf.d/sysadmin-agent.conf
+   apachectl configtest && apachectl graceful
+   ```
+3. **Cloudflare caching** — Purge cache in the Cloudflare dashboard after config changes. Test bypassing Cloudflare:
+   ```bash
+   curl -sk https://your-domain --resolve your-domain:443:YOUR_SERVER_IP | head -5
+   ```
+
+### Apache ProxyPass "Unable to parse URL"
+
+The URL in `ProxyPass` has extra characters (often `<` `>` angle brackets from copy-paste). The URL must be plain: `http://127.0.0.1:5000/` with no surrounding brackets.
+
+### Cloudflare SSL issues
+
+Set Cloudflare SSL/TLS mode to **Full (Strict)** when using Let's Encrypt certs. If set to "Flexible", Cloudflare sends HTTP to your server, which then redirects to HTTPS, causing a redirect loop.
+
+### Service won't start
+
+```bash
+journalctl -u sysadmin-agent -n 50    # Check logs
+which sysadmin-agent                   # Verify CLI is installed
+pip3 install -e /path/to/systems-admin-agent  # Reinstall if missing
+```
 
 ---
 

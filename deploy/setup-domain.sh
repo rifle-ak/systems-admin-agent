@@ -77,27 +77,56 @@ fi
 info "Installing Apache reverse proxy config to ${APACHE_CONF}..."
 cp "${DEPLOY_DIR}/apache-reverse-proxy.conf" "${APACHE_CONF}"
 
+# ── Step 3a: Detect server IP for cPanel vhost binding ────────────────
+# cPanel uses IP-based vhosts. Using *:80/*:443 causes requests to hit
+# the default cPanel vhost instead of ours. We must bind to the server's IP.
+SERVER_IP=""
+if command -v apachectl &>/dev/null; then
+    # Extract the IP that cPanel vhosts are bound to
+    SERVER_IP=$(apachectl -S 2>/dev/null | grep -oP '^\d+\.\d+\.\d+\.\d+' | head -1)
+fi
+if [[ -z "$SERVER_IP" ]]; then
+    # Fallback: use the primary IP from hostname
+    SERVER_IP=$(hostname -I 2>/dev/null | awk '{print $1}')
+fi
+
+if [[ -n "$SERVER_IP" ]]; then
+    info "Detected server IP: ${SERVER_IP} — binding vhosts to it."
+    sed -i "s/\*:80/${SERVER_IP}:80/g" "${APACHE_CONF}"
+    sed -i "s/\*:443/${SERVER_IP}:443/g" "${APACHE_CONF}"
+else
+    warn "Could not detect server IP. VirtualHost uses *:80/*:443."
+    warn "On cPanel servers, you may need to manually replace * with the server IP."
+    warn "Run: apachectl -S | head -5   to find the correct IP."
+fi
+
 # If SSL cert doesn't exist yet, comment out the SSL vhost to avoid Apache errors
 if [[ ! -f "/etc/letsencrypt/live/${DOMAIN}/fullchain.pem" ]]; then
     warn "No SSL cert found — disabling HTTPS vhost (HTTP-only for now)."
     # Replace the 443 vhost with a simple non-SSL proxy
-    cat > "${APACHE_CONF}" <<'HTTPCONF'
-<VirtualHost *:80>
-    ServerName server.contois.fyi
+    LISTEN_ADDR="${SERVER_IP:-*}"
+    cat > "${APACHE_CONF}" <<HTTPCONF
+<VirtualHost ${LISTEN_ADDR}:80>
+    ServerName ${DOMAIN}
     ProxyPreserveHost On
     ProxyPass / http://127.0.0.1:5000/
     ProxyPassReverse / http://127.0.0.1:5000/
     RewriteEngine On
     RewriteCond %{HTTP:Upgrade} =websocket [NC]
-    RewriteRule /(.*) ws://127.0.0.1:5000/$1 [P,L]
+    RewriteRule /(.*) ws://127.0.0.1:5000/\$1 [P,L]
     ProxyTimeout 300
 </VirtualHost>
 HTTPCONF
 fi
 
 # Test and reload Apache
-apachectl configtest && apachectl graceful
-info "Apache config installed and reloaded."
+info "Testing Apache configuration..."
+if apachectl configtest; then
+    apachectl graceful
+    info "Apache config installed and reloaded."
+else
+    error "Apache config test failed. Check ${APACHE_CONF} and fix any errors before reloading."
+fi
 
 # ── Step 4: Systemd service ─────────────────────────────────────────
 info "Installing systemd service..."
