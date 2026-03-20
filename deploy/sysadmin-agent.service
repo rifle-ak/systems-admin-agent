@@ -1,0 +1,18 @@
+[Unit]
+Description=Systems Admin Agent Web UI
+After=network.target
+
+[Service]
+Type=simple
+User=contois
+Group=contois
+WorkingDirectory=/home/contois/systems-admin-agent
+EnvironmentFile=/home/contois/systems-admin-agent/.env
+ExecStart=/home/contois/.local/bin/sysadmin-agent web --web-host 127.0.0.1 --web-port 5000
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
