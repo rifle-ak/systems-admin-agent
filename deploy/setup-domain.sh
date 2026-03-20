@@ -30,6 +30,16 @@ error() { echo -e "${RED}[x]${NC} $1"; exit 1; }
 # Must be root
 [[ $EUID -eq 0 ]] || error "Run this script as root: sudo bash $0"
 
+# ── Step 0: Install Python dependencies ───────────────────────────
+info "Installing Python dependencies..."
+if [[ -f "${APP_DIR}/requirements.txt" ]]; then
+    pip3 install -r "${APP_DIR}/requirements.txt" --quiet || warn "pip install failed — check manually"
+fi
+# Install the package itself if setup.py or pyproject.toml exists
+if [[ -f "${APP_DIR}/setup.py" ]] || [[ -f "${APP_DIR}/pyproject.toml" ]]; then
+    pip3 install -e "${APP_DIR}" --quiet || warn "pip install -e failed — check manually"
+fi
+
 # ── Step 1: Apache modules ──────────────────────────────────────────
 info "Enabling required Apache modules..."
 for mod in proxy proxy_http proxy_wstunnel headers ssl rewrite; do
@@ -43,8 +53,10 @@ if [[ ! -f "/etc/letsencrypt/live/${DOMAIN}/fullchain.pem" ]]; then
     info "Obtaining SSL certificate for ${DOMAIN}..."
     if command -v certbot &>/dev/null; then
         certbot certonly --webroot -w "/var/www/html" -d "${DOMAIN}" --non-interactive --agree-tos --register-unsafely-without-email || {
-            warn "Certbot webroot failed, trying standalone..."
+            warn "Certbot webroot failed, stopping Apache for standalone mode..."
+            systemctl stop httpd 2>/dev/null || apachectl stop 2>/dev/null || true
             certbot certonly --standalone -d "${DOMAIN}" --non-interactive --agree-tos --register-unsafely-without-email
+            systemctl start httpd 2>/dev/null || apachectl start 2>/dev/null || true
         }
     else
         warn "certbot not found. Install it or use cPanel AutoSSL."
